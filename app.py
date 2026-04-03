@@ -32,6 +32,10 @@ APP_RUNTIME_SIGNATURE = f"v{BOT_VERSION} | rev {APP_REVISION} | build {APP_BUILD
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 TP_SHARED_SECRET = os.getenv("TP_SHARED_SECRET", "").strip()
 TP_AGENT_DIGEST = os.getenv("TP_AGENT_DIGEST", "").strip().lower()
+ALLOW_DEBUG_QUERY_PARAM = (
+    os.getenv("ALLOW_DEBUG_QUERY_PARAM", "0").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
 ALLOW_SECRET_QUERY_PARAM = (
     os.getenv("ALLOW_SECRET_QUERY_PARAM", "0").strip().lower()
     in {"1", "true", "yes", "on"}
@@ -77,6 +81,16 @@ class ApiError(Exception):
 
     message: str
     status_code: int
+    debug: dict[str, Any] | None = None
+
+
+def _debug_requested() -> bool:
+    """Return True when debug output is explicitly requested and allowed."""
+    if not ALLOW_DEBUG_QUERY_PARAM:
+        return False
+
+    raw = request.args.get("tp_debug", "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 
 
 def _resolve_secret_from_request() -> str:
@@ -367,20 +381,50 @@ def _fetch_discord_messages(channel_id: str, limit: int) -> list[dict[str, Any]]
             timeout=DISCORD_HTTP_TIMEOUT_SECONDS,
         )
     except requests.RequestException as exc:
-        raise ApiError("discord_upstream_unreachable", 502) from exc
+        raise ApiError(
+            "discord_upstream_unreachable",
+            502,
+            debug={"upstream": "discord", "exception": type(exc).__name__},
+        ) from exc
+
+    response_body_json: Any | None = None
+    try:
+        response_body_json = response.json()
+    except ValueError:
+        response_body_json = None
 
     if response.status_code == 401:
-        raise ApiError("discord_token_rejected", 502)
+        raise ApiError(
+            "discord_token_rejected",
+            502,
+            debug={"discord_status": 401},
+        )
     if response.status_code == 403:
-        raise ApiError("discord_forbidden_channel", 403)
+        debug = {"discord_status": 403}
+        if isinstance(response_body_json, dict):
+            debug["discord_code"] = response_body_json.get("code")
+            debug["discord_message"] = response_body_json.get("message")
+        raise ApiError("discord_forbidden_channel", 403, debug=debug)
     if response.status_code == 404:
-        raise ApiError("discord_channel_not_found", 404)
+        debug = {"discord_status": 404}
+        if isinstance(response_body_json, dict):
+            debug["discord_code"] = response_body_json.get("code")
+            debug["discord_message"] = response_body_json.get("message")
+        raise ApiError("discord_channel_not_found", 404, debug=debug)
     if response.status_code >= 400:
-        raise ApiError("discord_upstream_error", 502)
+        debug = {"discord_status": response.status_code}
+        if isinstance(response_body_json, dict):
+            debug["discord_code"] = response_body_json.get("code")
+            debug["discord_message"] = response_body_json.get("message")
+        raise ApiError("discord_upstream_error", 502, debug=debug)
 
-    data = response.json()
+    data = response_body_json
     if not isinstance(data, list):
-        raise ApiError("discord_unexpected_payload", 502)
+        raise ApiError(
+            "discord_unexpected_payload",
+            502,
+            debug={"discord_status": response.status_code, "payload_type": type(data).__name__},
+        )
 
     return [_normalize_message(msg) for msg in data]
 
@@ -426,6 +470,7 @@ def health() -> tuple[Any, int]:
 @app.route("/messages", methods=["GET"])
 def get_messages() -> tuple[Any, int]:
     """Return latest messages for a Discord channel by channel ID."""
+    debug_enabled = _debug_requested()
     _record_message_request()
     try:
         channel_id = _validate_channel_id(request.args.get("channel_id"))
@@ -433,7 +478,32 @@ def get_messages() -> tuple[Any, int]:
         _authorize_request(channel_id, limit)
         messages = _fetch_discord_messages(channel_id, limit)
     except ApiError as exc:
-        return jsonify({"error": exc.message}), exc.status_code
+        payload: dict[str, Any] = {"error": exc.message}
+        if debug_enabled:
+            payload["debug"] = {
+                "channel_id": request.args.get("channel_id", ""),
+                "limit": request.args.get("limit", ""),
+                "hint": "For private threads, the bot must be an explicit thread member with Read Message History.",
+            }
+            if exc.debug:
+                payload["debug"].update(exc.debug)
+        return jsonify(payload), exc.status_code
+
+    if debug_enabled:
+        return (
+            jsonify(
+                {
+                    "messages": messages,
+                    "debug": {
+                        "channel_id": channel_id,
+                        "limit": limit,
+                        "returned_count": len(messages),
+                        "hint": "If returned_count is 0 for a private thread, add the bot as a thread member and grant Read Message History.",
+                    },
+                }
+            ),
+            200,
+        )
 
     return jsonify(messages), 200
 

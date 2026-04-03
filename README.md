@@ -41,6 +41,16 @@ Branding note: we style the name as `tinyPeople`, but hostnames and filesystem p
 
 Tune window sizes with `METRICS_WINDOW_SECONDS` and `UNIQUE_HOST_WINDOW_SECONDS`.
 
+## Debug Query Mode
+
+For targeted troubleshooting, enable `ALLOW_DEBUG_QUERY_PARAM=1` and call:
+
+```text
+/messages?...&tp_debug=1
+```
+
+When enabled, responses include a `debug` object with non-secret diagnostics such as Discord upstream status/code and thread access hints.
+
 ## Agent-Friendly Auth Options
 
 Use one of these based on what your client can do.
