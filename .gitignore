@@ -1,0 +1,11 @@
+.env
+.deploy-stamp.env
+.cpanel.yml.USERNAME
+__pycache__/
+*.pyc
+*.pyo
+*.log
+.venv/
+venv/
+ops/.env
+ops/known_hosts

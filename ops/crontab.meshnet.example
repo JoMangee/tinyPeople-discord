@@ -1,0 +1,12 @@
+# tinyPeople Messages API cron manifest (optional watchdog)
+#
+# Apply with:
+#   crontab tinyPeople-discord-messages-api/ops/crontab.USERNAME.example
+#
+# Passenger normally keeps the API up; this watchdog can self-heal in edge cases.
+
+SHELL=/bin/bash
+PATH=/usr/local/bin:/usr/bin:/bin
+
+# Light health check every 5 minutes. If unhealthy, touch restart file.
+*/5 * * * * /bin/bash -lc 'curl -fsS https://your-domain/health >/dev/null || touch /home2/USERNAME/APPDOMAIN/tmp/restart.txt'
