@@ -7,8 +7,12 @@ from a Discord channel using a bot token that stays server-side.
 
 from __future__ import annotations
 
+from collections import deque
 import hmac
+import hashlib
 import os
+from threading import Lock
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -27,6 +31,29 @@ APP_RUNTIME_SIGNATURE = f"v{BOT_VERSION} | rev {APP_REVISION} | build {APP_BUILD
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 TP_SHARED_SECRET = os.getenv("TP_SHARED_SECRET", "").strip()
+TP_AGENT_DIGEST = os.getenv("TP_AGENT_DIGEST", "").strip().lower()
+ALLOW_SECRET_QUERY_PARAM = (
+    os.getenv("ALLOW_SECRET_QUERY_PARAM", "0").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+ALLOW_STATIC_DIGEST_QUERY_PARAM = (
+    os.getenv("ALLOW_STATIC_DIGEST_QUERY_PARAM", "1").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+TP_DIGEST_SALT = os.getenv("TP_DIGEST_SALT", "").strip()
+ALLOW_SIGNED_QUERY_PARAM = (
+    os.getenv("ALLOW_SIGNED_QUERY_PARAM", "1").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+REQUIRE_SIGNED_AUTH = (
+    os.getenv("REQUIRE_SIGNED_AUTH", "0").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+SIGNED_TIMESTAMP_TOLERANCE_SECONDS = int(
+    os.getenv("SIGNED_TIMESTAMP_TOLERANCE_SECONDS", "300")
+)
+METRICS_WINDOW_SECONDS = int(os.getenv("METRICS_WINDOW_SECONDS", "60"))
+UNIQUE_HOST_WINDOW_SECONDS = int(os.getenv("UNIQUE_HOST_WINDOW_SECONDS", "300"))
 DEFAULT_MESSAGE_LIMIT = int(os.getenv("DEFAULT_MESSAGE_LIMIT", "20"))
 MAX_MESSAGE_LIMIT = int(os.getenv("MAX_MESSAGE_LIMIT", "50"))
 DISCORD_HTTP_TIMEOUT_SECONDS = float(os.getenv("DISCORD_HTTP_TIMEOUT_SECONDS", "15"))
@@ -38,6 +65,10 @@ ALLOWED_CHANNEL_IDS = {
 }
 
 app = Flask(__name__)
+RECENT_NONCES: dict[str, int] = {}
+MESSAGE_REQUEST_TIMESTAMPS: deque[int] = deque()
+MESSAGE_HOST_SEEN_AT: dict[str, int] = {}
+MESSAGE_METRICS_LOCK = Lock()
 
 
 @dataclass
@@ -58,13 +89,200 @@ def _resolve_secret_from_request() -> str:
     if auth_header.lower().startswith("bearer "):
         return auth_header[7:].strip()
 
+    if ALLOW_SECRET_QUERY_PARAM:
+        # Optional fallback for clients that cannot set custom headers.
+        query_secret = request.args.get("tp_secret", "").strip()
+        if query_secret:
+            return query_secret
+
     return ""
 
 
-def _authorize_request() -> None:
+def _resolve_signed_fields_from_request() -> tuple[str, str, str]:
+    """Read signed-auth fields from headers or optional query params."""
+    ts = request.headers.get("X-TinyPeople-Timestamp", "").strip()
+    nonce = request.headers.get("X-TinyPeople-Nonce", "").strip()
+    sig = request.headers.get("X-TinyPeople-Signature", "").strip()
+
+    if ts and nonce and sig:
+        return ts, nonce, sig
+
+    if ALLOW_SIGNED_QUERY_PARAM:
+        ts = request.args.get("tp_ts", "").strip()
+        nonce = request.args.get("tp_nonce", "").strip()
+        sig = request.args.get("tp_sig", "").strip()
+
+    return ts, nonce, sig
+
+
+def _resolve_digest_from_request() -> str:
+    """Read static digest token from header or optional query param."""
+    digest = request.headers.get("X-TinyPeople-Digest", "").strip()
+    if digest:
+        return digest
+
+    if ALLOW_STATIC_DIGEST_QUERY_PARAM:
+        return request.args.get("tp_digest", "").strip()
+
+    return ""
+
+
+def _has_signed_auth_material() -> bool:
+    """Detect whether signed-auth inputs were supplied."""
+    ts, nonce, sig = _resolve_signed_fields_from_request()
+    return bool(ts or nonce or sig)
+
+
+def _prune_old_nonces(now: int) -> None:
+    """Drop nonce entries outside the accepted timestamp tolerance window."""
+    cutoff = now - SIGNED_TIMESTAMP_TOLERANCE_SECONDS
+    stale = [nonce for nonce, ts in RECENT_NONCES.items() if ts < cutoff]
+    for nonce in stale:
+        RECENT_NONCES.pop(nonce, None)
+
+
+def _client_ip_from_request() -> str:
+    """Resolve client IP, preferring proxy-forwarded headers when present."""
+    xff = request.headers.get("X-Forwarded-For", "").strip()
+    if xff:
+        first = xff.split(",", 1)[0].strip()
+        if first:
+            return first
+
+    x_real_ip = request.headers.get("X-Real-IP", "").strip()
+    if x_real_ip:
+        return x_real_ip
+
+    return request.remote_addr or "unknown"
+
+
+def _prune_message_metrics(now: int) -> None:
+    """Remove stale request timestamps and stale host observations."""
+    cutoff = now - METRICS_WINDOW_SECONDS
+    while MESSAGE_REQUEST_TIMESTAMPS and MESSAGE_REQUEST_TIMESTAMPS[0] < cutoff:
+        MESSAGE_REQUEST_TIMESTAMPS.popleft()
+
+    host_cutoff = now - UNIQUE_HOST_WINDOW_SECONDS
+    stale_hosts = [
+        host for host, seen_at in MESSAGE_HOST_SEEN_AT.items() if seen_at < host_cutoff
+    ]
+    for host in stale_hosts:
+        MESSAGE_HOST_SEEN_AT.pop(host, None)
+
+
+def _record_message_request() -> None:
+    """Track request volume and unique hosts for /messages endpoint."""
+    now = int(time.time())
+    host = _client_ip_from_request()
+    with MESSAGE_METRICS_LOCK:
+        MESSAGE_REQUEST_TIMESTAMPS.append(now)
+        MESSAGE_HOST_SEEN_AT[host] = now
+        _prune_message_metrics(now)
+
+
+def _message_metrics_snapshot() -> dict[str, Any]:
+    """Return current /messages request telemetry snapshot."""
+    now = int(time.time())
+    with MESSAGE_METRICS_LOCK:
+        _prune_message_metrics(now)
+        request_count = len(MESSAGE_REQUEST_TIMESTAMPS)
+        rate_per_minute = (request_count * 60.0) / max(METRICS_WINDOW_SECONDS, 1)
+        unique_hosts = len(MESSAGE_HOST_SEEN_AT)
+
+    return {
+        "requests_in_window": request_count,
+        "window_seconds": METRICS_WINDOW_SECONDS,
+        "request_rate_per_minute": round(rate_per_minute, 2),
+        "unique_hosts_in_window": unique_hosts,
+        "unique_hosts_window_seconds": UNIQUE_HOST_WINDOW_SECONDS,
+    }
+
+
+def _build_signature_payload(channel_id: str, limit: int, ts: str, nonce: str) -> str:
+    """Build canonical payload used by client and server for HMAC verification."""
+    return "\n".join(
+        [
+            request.method.upper(),
+            request.path,
+            channel_id,
+            str(limit),
+            ts,
+            nonce,
+        ]
+    )
+
+
+def _authorize_static_digest() -> None:
+    """Authorize request using a static salted digest token.
+
+    This is intentionally simple for constrained clients that cannot compute
+    per-request HMACs. Treat it as a bearer token variant.
+    """
+    provided = _resolve_digest_from_request()
+    if not provided:
+        raise ApiError("missing_digest", 401)
+
+    expected = TP_AGENT_DIGEST
+    if not expected:
+        if not TP_DIGEST_SALT:
+            raise ApiError("server_missing_digest_salt", 503)
+        expected = hashlib.sha256(
+            f"{TP_DIGEST_SALT}:{TP_SHARED_SECRET}".encode("utf-8")
+        ).hexdigest()
+
+    if not hmac.compare_digest(provided.lower(), expected):
+        raise ApiError("invalid_digest", 403)
+
+
+def _authorize_signed_request(channel_id: str, limit: int) -> None:
+    """Authorize request via timestamped HMAC signature to avoid raw secret transit."""
+    ts_raw, nonce, provided_sig = _resolve_signed_fields_from_request()
+    if not ts_raw or not nonce or not provided_sig:
+        raise ApiError("missing_signed_auth_fields", 401)
+
+    try:
+        ts_value = int(ts_raw)
+    except ValueError as exc:
+        raise ApiError("invalid_signed_timestamp", 401) from exc
+
+    now = int(time.time())
+    if abs(now - ts_value) > SIGNED_TIMESTAMP_TOLERANCE_SECONDS:
+        raise ApiError("signed_timestamp_out_of_window", 401)
+
+    _prune_old_nonces(now)
+    if nonce in RECENT_NONCES:
+        raise ApiError("signed_nonce_reused", 401)
+
+    payload = _build_signature_payload(channel_id, limit, ts_raw, nonce)
+    expected_sig = hmac.new(
+        TP_SHARED_SECRET.encode("utf-8"),
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    if not hmac.compare_digest(provided_sig.lower(), expected_sig):
+        raise ApiError("invalid_signed_signature", 403)
+
+    RECENT_NONCES[nonce] = ts_value
+
+
+def _authorize_request(channel_id: str, limit: int) -> None:
     """Validate shared secret without exposing sensitive values."""
     if not TP_SHARED_SECRET:
         raise ApiError("server_missing_shared_secret", 503)
+
+    if REQUIRE_SIGNED_AUTH:
+        _authorize_signed_request(channel_id, limit)
+        return
+
+    digest_candidate = _resolve_digest_from_request()
+    if digest_candidate:
+        _authorize_static_digest()
+        return
+
+    if _has_signed_auth_material():
+        _authorize_signed_request(channel_id, limit)
+        return
 
     provided = _resolve_secret_from_request()
     if not provided:
@@ -198,6 +416,7 @@ def health() -> tuple[Any, int]:
                 "runtime_signature": APP_RUNTIME_SIGNATURE,
                 "has_discord_token": bool(DISCORD_TOKEN),
                 "has_shared_secret": bool(TP_SHARED_SECRET),
+                "messages_telemetry": _message_metrics_snapshot(),
             }
         ),
         200,
@@ -207,10 +426,11 @@ def health() -> tuple[Any, int]:
 @app.route("/messages", methods=["GET"])
 def get_messages() -> tuple[Any, int]:
     """Return latest messages for a Discord channel by channel ID."""
+    _record_message_request()
     try:
-        _authorize_request()
         channel_id = _validate_channel_id(request.args.get("channel_id"))
         limit = _parse_limit(request.args.get("limit"))
+        _authorize_request(channel_id, limit)
         messages = _fetch_discord_messages(channel_id, limit)
     except ApiError as exc:
         return jsonify({"error": exc.message}), exc.status_code
