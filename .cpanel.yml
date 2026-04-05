@@ -18,17 +18,7 @@ deployment:
     - /bin/chmod 755 "$APPROOT" 2>&1 | /usr/bin/tee -a "$LOGFILE"
     - /bin/mkdir -p "$APPROOT/tmp" 2>&1 | /usr/bin/tee -a "$LOGFILE"
     - /bin/chmod 755 "$APPROOT/tmp" 2>&1 | /usr/bin/tee -a "$LOGFILE"
-    - >
-      /bin/bash -lc '
-      for f in .htaccess passenger_wsgi.py app.py requirements.txt README.md INSTALL.md .env.example; do
-        if [ -f "$APPROOT/$f" ]; then
-          /bin/chmod 644 "$APPROOT/$f"
-        fi
-      done
-      if [ -f "$APPROOT/.env" ]; then
-        /bin/chmod 600 "$APPROOT/.env"
-      fi
-      ' 2>&1 | /usr/bin/tee -a "$LOGFILE"
+    - /bin/bash -c 'for f in .htaccess passenger_wsgi.py app.py requirements.txt README.md INSTALL.md .env.example; do [ -f "$APPROOT/$f" ] && /bin/chmod 644 "$APPROOT/$f"; done; [ -f "$APPROOT/.env" ] && /bin/chmod 600 "$APPROOT/.env"; exit 0' 2>&1 | /usr/bin/tee -a "$LOGFILE"
     - /bin/echo "[deploy] writing runtime stamp file" | /usr/bin/tee -a "$LOGFILE"
     - /bin/printf 'POD_APP_REVISION=%s\nPOD_APP_BUILD=%s\n' "$REVISION" "$BUILDSTAMP" > "$APPROOT/.deploy-stamp.env"
     - /bin/chmod 644 "$APPROOT/.deploy-stamp.env" 2>&1 | /usr/bin/tee -a "$LOGFILE"
