@@ -21,7 +21,7 @@ import requests
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 
-BOT_VERSION = "0.1.0"
+BOT_VERSION = "0.1.1"
 APP_DIR = os.path.dirname(__file__)
 load_dotenv(os.path.join(APP_DIR, ".env"))
 load_dotenv(os.path.join(APP_DIR, ".deploy-stamp.env"))
