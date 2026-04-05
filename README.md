@@ -182,4 +182,30 @@ Use the tinyPeople scripts there:
 - `scripts/verify-tinyPeople-deploy.ps1`
 - `scripts/verify-tinyPeople-deploy.sh`
 
+For this repository, you can also bootstrap a reliable local PowerShell SSH environment with:
+
+```powershell
+.\ops\scripts\Use-TinyPeopleRepoEnv.ps1
+```
+
+That script ensures `~/.ssh/known_hosts` exists, sets `GIT_SSH_COMMAND` in-session, and writes local repo `core.sshCommand`.
+If your home `.ssh` path is blocked, it automatically falls back to `.git/known_hosts` inside this repo.
+If your host uses a non-default SSH port, pass it explicitly:
+
+```powershell
+.\ops\scripts\Use-TinyPeopleRepoEnv.ps1 -Port 22
+```
+
+For local-only host settings, put values in `ops/.env` (already gitignored):
+
+```text
+TP_SSH_KEY_PATH=C:/path/to/private_key
+TP_SSH_HOST=example.com
+TP_SSH_USER=user
+TP_SSH_PORT=22
+```
+
+Set your real non-default port in local `ops/.env` via `TP_SSH_PORT` (gitignored), and keep the README command examples generic.
+The script reads `ops/.env` first (unless flags are explicitly passed), so host-specific details stay local.
+
 This keeps server-specific paths, SSH details, and operational runbooks out of the shared project codebase.
