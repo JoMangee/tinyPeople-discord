@@ -729,5 +729,71 @@ def get_messages() -> tuple[Any, int]:
     return jsonify(messages), 200
 
 
+@app.route("/image-chunk", methods=["GET"])
+def get_image_chunk() -> tuple[Any, int]:
+    """Return a single base64 chunk of an image by URL and chunk index.
+
+    Query params:
+      url        - Discord CDN image URL (required)
+      chunk      - zero-based chunk index (default 0)
+      chunk_chars - chars per chunk (default RAW_IMAGE_CHUNK_CHARS)
+      tp_digest / tp_secret / etc - auth as normal
+    """
+    try:
+        _authorize_request("0", 1)
+    except ApiError as exc:
+        return jsonify({"error": exc.message}), exc.status_code
+
+    url = request.args.get("url", "").strip()
+    if not url:
+        return jsonify({"error": "missing_url"}), 400
+
+    try:
+        chunk_index = int(request.args.get("chunk", "0"))
+    except ValueError:
+        return jsonify({"error": "invalid_chunk_index"}), 400
+
+    try:
+        chunk_chars = int(request.args.get("chunk_chars", str(RAW_IMAGE_CHUNK_CHARS)))
+        chunk_chars = max(1024, min(chunk_chars, 65536))
+    except ValueError:
+        chunk_chars = RAW_IMAGE_CHUNK_CHARS
+
+    try:
+        resp = requests.get(url, timeout=RAW_IMAGE_FETCH_TIMEOUT_SECONDS)
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        return jsonify({"error": f"fetch_failed:{type(exc).__name__}"}), 502
+
+    body = resp.content
+    if len(body) > RAW_IMAGE_MODE_MAX_BYTES:
+        return jsonify({
+            "error": "image_too_large",
+            "size_bytes": len(body),
+            "max_bytes": RAW_IMAGE_MODE_MAX_BYTES,
+        }), 413
+
+    b64 = base64.b64encode(body).decode("ascii")
+    chunks = _chunk_text(b64, chunk_chars)
+    total = len(chunks)
+
+    if chunk_index < 0 or chunk_index >= total:
+        return jsonify({
+            "error": "chunk_index_out_of_range",
+            "chunk_count": total,
+        }), 400
+
+    return jsonify({
+        "url": url,
+        "content_type": resp.headers.get("content-type", ""),
+        "size_bytes": len(body),
+        "encoding": "base64",
+        "chunk_chars": chunk_chars,
+        "chunk_index": chunk_index,
+        "chunk_count": total,
+        "chunk": chunks[chunk_index],
+    }), 200
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")), debug=False)
