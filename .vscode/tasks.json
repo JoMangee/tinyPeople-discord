@@ -4,7 +4,7 @@
         {
             "label": "Push to cPanel (tinyPeople)",
             "type": "shell",
-            "command": ". .\\ops\\scripts\\Use-TinyPeopleRepoEnv.ps1; git push cpanel-tinyPeople master",
+            "command": ". .\\ops\\scripts\\Use-TinyPeopleRepoEnv.ps1 -Push",
             "options": {
                 "shell": {
                     "executable": "pwsh",
