@@ -7,6 +7,7 @@ from a Discord channel using a bot token that stays server-side.
 
 from __future__ import annotations
 
+import base64
 from collections import deque
 import hmac
 import hashlib
@@ -58,6 +59,10 @@ SIGNED_TIMESTAMP_TOLERANCE_SECONDS = int(
 )
 METRICS_WINDOW_SECONDS = int(os.getenv("METRICS_WINDOW_SECONDS", "60"))
 UNIQUE_HOST_WINDOW_SECONDS = int(os.getenv("UNIQUE_HOST_WINDOW_SECONDS", "300"))
+RAW_IMAGE_MODE_MAX_BYTES = int(os.getenv("RAW_IMAGE_MODE_MAX_BYTES", "786432"))
+RAW_IMAGE_CHUNK_CHARS = int(os.getenv("RAW_IMAGE_CHUNK_CHARS", "12000"))
+RAW_IMAGE_FETCH_TIMEOUT_SECONDS = float(os.getenv("RAW_IMAGE_FETCH_TIMEOUT_SECONDS", "15"))
+RAW_IMAGE_MAX_ATTACHMENTS = int(os.getenv("RAW_IMAGE_MAX_ATTACHMENTS", "3"))
 DEFAULT_MESSAGE_LIMIT = int(os.getenv("DEFAULT_MESSAGE_LIMIT", "20"))
 MAX_MESSAGE_LIMIT = int(os.getenv("MAX_MESSAGE_LIMIT", "50"))
 DISCORD_HTTP_TIMEOUT_SECONDS = float(os.getenv("DISCORD_HTTP_TIMEOUT_SECONDS", "15"))
@@ -91,6 +96,16 @@ def _debug_requested() -> bool:
 
     raw = request.args.get("tp_debug", "").strip().lower()
     return raw in {"1", "true", "yes", "on"}
+
+
+def _raw_image_mode_requested() -> bool:
+    """Return True when caller asks for raw image payloads."""
+    mode = request.args.get("tp_image_mode", "").strip().lower()
+    if mode == "raw":
+        return True
+
+    mode = request.args.get("image_mode", "").strip().lower()
+    return mode == "raw"
 
 
 def _resolve_secret_from_request() -> str:
@@ -337,6 +352,18 @@ def _validate_channel_id(channel_id_raw: str | None) -> str:
     return channel_id
 
 
+def _validate_message_id(message_id_raw: str | None) -> str | None:
+    """Validate optional message_id query parameter."""
+    if not message_id_raw:
+        return None
+
+    message_id = message_id_raw.strip()
+    if not message_id.isdigit():
+        raise ApiError("invalid_message_id", 400)
+
+    return message_id
+
+
 def _format_author(author: dict[str, Any]) -> str:
     """Normalize Discord author object into stable display name."""
     username = author.get("username", "unknown")
@@ -346,22 +373,200 @@ def _format_author(author: dict[str, Any]) -> str:
     return username
 
 
-def _normalize_message(message: dict[str, Any]) -> dict[str, Any]:
+def _chunk_text(value: str, chunk_chars: int) -> list[str]:
+    """Split text into deterministic chunks for text-only transport."""
+    size = max(chunk_chars, 1)
+    return [value[i : i + size] for i in range(0, len(value), size)]
+
+
+def _build_raw_image_payloads(attachments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Fetch image attachments and return chunked base64 payloads."""
+    payloads: list[dict[str, Any]] = []
+    considered = 0
+
+    for item in attachments:
+        if considered >= RAW_IMAGE_MAX_ATTACHMENTS:
+            break
+
+        url = str(item.get("url") or "")
+        if not url:
+            continue
+
+        content_type = str(item.get("content_type") or "")
+        has_image_marker = content_type.startswith("image/") or bool(item.get("width"))
+        if not has_image_marker:
+            continue
+
+        considered += 1
+        file_size = int(item.get("size") or 0)
+        if file_size and file_size > RAW_IMAGE_MODE_MAX_BYTES:
+            payloads.append(
+                {
+                    "url": url,
+                    "filename": str(item.get("filename") or ""),
+                    "content_type": content_type,
+                    "size_bytes": file_size,
+                    "skipped": "file_too_large",
+                    "max_bytes": RAW_IMAGE_MODE_MAX_BYTES,
+                }
+            )
+            continue
+
+        try:
+            response = requests.get(url, timeout=RAW_IMAGE_FETCH_TIMEOUT_SECONDS)
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            payloads.append(
+                {
+                    "url": url,
+                    "filename": str(item.get("filename") or ""),
+                    "content_type": content_type,
+                    "error": f"fetch_failed:{type(exc).__name__}",
+                }
+            )
+            continue
+
+        body = response.content
+        if len(body) > RAW_IMAGE_MODE_MAX_BYTES:
+            payloads.append(
+                {
+                    "url": url,
+                    "filename": str(item.get("filename") or ""),
+                    "content_type": response.headers.get("content-type", content_type),
+                    "size_bytes": len(body),
+                    "skipped": "body_too_large",
+                    "max_bytes": RAW_IMAGE_MODE_MAX_BYTES,
+                }
+            )
+            continue
+
+        b64 = base64.b64encode(body).decode("ascii")
+        chunks = _chunk_text(b64, RAW_IMAGE_CHUNK_CHARS)
+        payloads.append(
+            {
+                "url": url,
+                "filename": str(item.get("filename") or ""),
+                "content_type": response.headers.get("content-type", content_type),
+                "size_bytes": len(body),
+                "encoding": "base64",
+                "chunk_chars": RAW_IMAGE_CHUNK_CHARS,
+                "chunk_count": len(chunks),
+                "chunks": chunks,
+            }
+        )
+
+    return payloads
+
+
+def _normalize_message(
+    message: dict[str, Any], *, include_raw_images: bool = False
+) -> dict[str, Any]:
     """Convert Discord message payload to contract output shape."""
     content = message.get("content", "")
+    raw_attachments = message.get("attachments")
+    attachments = raw_attachments if isinstance(raw_attachments, list) else []
+    attachment_urls = [
+        str(item.get("url"))
+        for item in attachments
+        if isinstance(item, dict) and item.get("url")
+    ]
+    image_urls = [
+        str(item.get("url"))
+        for item in attachments
+        if isinstance(item, dict)
+        and item.get("url")
+        and (str(item.get("content_type", "")).startswith("image/") or item.get("width"))
+    ]
 
     # Preserve signal for non-text entries while keeping the response compact.
-    if not content and message.get("attachments"):
+    if not content and attachments:
         content = "[attachment]"
 
-    return {
+    normalized = {
         "timestamp": message.get("timestamp"),
+        "message_id": message.get("id"),
         "author": _format_author(message.get("author", {})),
         "content": content,
+        "attachment_urls": attachment_urls,
+        "image_urls": image_urls,
     }
 
+    if include_raw_images:
+        normalized["raw_images"] = _build_raw_image_payloads(attachments)
 
-def _fetch_discord_messages(channel_id: str, limit: int) -> list[dict[str, Any]]:
+    return normalized
+
+
+def _fetch_discord_message_by_id(
+    channel_id: str, message_id: str, *, include_raw_images: bool = False
+) -> dict[str, Any]:
+    """Read one specific message from Discord REST API by message ID."""
+    if not DISCORD_TOKEN:
+        raise ApiError("server_missing_discord_token", 503)
+
+    url = f"https://discord.com/api/v10/channels/{channel_id}/messages/{message_id}"
+    headers = {
+        "Authorization": f"Bot {DISCORD_TOKEN}",
+        "User-Agent": "tinyPeople-messages-api/0.1.0",
+    }
+
+    try:
+        response = requests.get(
+            url,
+            headers=headers,
+            timeout=DISCORD_HTTP_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException as exc:
+        raise ApiError(
+            "discord_upstream_unreachable",
+            502,
+            debug={"upstream": "discord", "exception": type(exc).__name__},
+        ) from exc
+
+    response_body_json: Any | None = None
+    try:
+        response_body_json = response.json()
+    except ValueError:
+        response_body_json = None
+
+    if response.status_code == 401:
+        raise ApiError(
+            "discord_token_rejected",
+            502,
+            debug={"discord_status": 401},
+        )
+    if response.status_code == 403:
+        debug = {"discord_status": 403}
+        if isinstance(response_body_json, dict):
+            debug["discord_code"] = response_body_json.get("code")
+            debug["discord_message"] = response_body_json.get("message")
+        raise ApiError("discord_forbidden_channel", 403, debug=debug)
+    if response.status_code == 404:
+        debug = {"discord_status": 404}
+        if isinstance(response_body_json, dict):
+            debug["discord_code"] = response_body_json.get("code")
+            debug["discord_message"] = response_body_json.get("message")
+        raise ApiError("discord_message_not_found", 404, debug=debug)
+    if response.status_code >= 400:
+        debug = {"discord_status": response.status_code}
+        if isinstance(response_body_json, dict):
+            debug["discord_code"] = response_body_json.get("code")
+            debug["discord_message"] = response_body_json.get("message")
+        raise ApiError("discord_upstream_error", 502, debug=debug)
+
+    if not isinstance(response_body_json, dict):
+        raise ApiError(
+            "discord_unexpected_payload",
+            502,
+            debug={"discord_status": response.status_code, "payload_type": type(response_body_json).__name__},
+        )
+
+    return _normalize_message(response_body_json, include_raw_images=include_raw_images)
+
+
+def _fetch_discord_messages(
+    channel_id: str, limit: int, *, include_raw_images: bool = False
+) -> list[dict[str, Any]]:
     """Read message history from Discord REST API."""
     if not DISCORD_TOKEN:
         raise ApiError("server_missing_discord_token", 503)
@@ -426,7 +631,7 @@ def _fetch_discord_messages(channel_id: str, limit: int) -> list[dict[str, Any]]
             debug={"discord_status": response.status_code, "payload_type": type(data).__name__},
         )
 
-    return [_normalize_message(msg) for msg in data]
+    return [_normalize_message(msg, include_raw_images=include_raw_images) for msg in data]
 
 
 @app.route("/")
@@ -471,17 +676,31 @@ def health() -> tuple[Any, int]:
 def get_messages() -> tuple[Any, int]:
     """Return latest messages for a Discord channel by channel ID."""
     debug_enabled = _debug_requested()
+    raw_image_mode = _raw_image_mode_requested()
     _record_message_request()
     try:
         channel_id = _validate_channel_id(request.args.get("channel_id"))
+        message_id = _validate_message_id(request.args.get("message_id"))
         limit = _parse_limit(request.args.get("limit"))
         _authorize_request(channel_id, limit)
-        messages = _fetch_discord_messages(channel_id, limit)
+        if message_id:
+            messages = [
+                _fetch_discord_message_by_id(
+                    channel_id, message_id, include_raw_images=raw_image_mode
+                )
+            ]
+        else:
+            messages = _fetch_discord_messages(
+                channel_id, limit, include_raw_images=raw_image_mode
+            )
     except ApiError as exc:
         payload: dict[str, Any] = {"error": exc.message}
         if debug_enabled:
             payload["debug"] = {
                 "channel_id": request.args.get("channel_id", ""),
+                "message_id": request.args.get("message_id", ""),
+                "image_mode": request.args.get("tp_image_mode", "")
+                or request.args.get("image_mode", ""),
                 "limit": request.args.get("limit", ""),
                 "hint": "For private threads, the bot must be an explicit thread member with Read Message History.",
             }
@@ -496,6 +715,8 @@ def get_messages() -> tuple[Any, int]:
                     "messages": messages,
                     "debug": {
                         "channel_id": channel_id,
+                        "message_id": message_id,
+                        "image_mode": "raw" if raw_image_mode else "off",
                         "limit": limit,
                         "returned_count": len(messages),
                         "hint": "If returned_count is 0 for a private thread, add the bot as a thread member and grant Read Message History.",

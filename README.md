@@ -11,6 +11,8 @@ Branding note: we style the name as `tinyPeople`, but hostnames and filesystem p
 - Query params:
   - `channel_id` (required)
   - `limit` (optional, default from env)
+  - `message_id` (optional, fetch exact message when provided)
+  - `tp_image_mode=raw` (optional, include base64 image chunks for text-only agents)
 - Auth:
   - Header `X-TinyPeople-Secret: <shared_secret>`
   - Or `Authorization: Bearer <shared_secret>`
@@ -20,8 +22,28 @@ Branding note: we style the name as `tinyPeople`, but hostnames and filesystem p
 - Response:
   - JSON array of objects with:
     - `timestamp`
+    - `message_id`
     - `author`
     - `content`
+    - `attachment_urls`
+    - `image_urls`
+    - `raw_images` (only when `tp_image_mode=raw`)
+
+## Raw Image Mode
+
+For text-only agents that can process chunked payloads, request raw image data:
+
+```text
+/messages?...&tp_image_mode=raw
+```
+
+Each `raw_images` item includes:
+
+1. `encoding` (`base64`)
+1. `chunk_chars` and `chunk_count`
+1. `chunks` array (base64 segments in order)
+
+Limits are controlled by `RAW_IMAGE_MODE_MAX_BYTES`, `RAW_IMAGE_CHUNK_CHARS`, and `RAW_IMAGE_MAX_ATTACHMENTS`.
 
 ## Why this keeps token at arm's length
 
@@ -60,6 +82,47 @@ Use one of these based on what your client can do.
 1. Simple derived digest (one-time setup): set `TP_DIGEST_SALT` and `TP_SHARED_SECRET`, compute digest once as `sha256("<salt>:<shared_secret>")`, and have the client send that as `tp_digest`.
 
 1. Strong signed requests (recommended for capable clients): send `tp_ts`, `tp_nonce`, and `tp_sig` where `tp_sig` is HMAC-SHA256 over the canonical payload; optionally enforce this mode with `REQUIRE_SIGNED_AUTH=1`.
+
+## Example URLs (Digest Mode)
+
+Replace placeholders with your values:
+
+1. `YOUR_DOMAIN` (for example `api.example.com`)
+1. `CHANNEL_ID`
+1. `MESSAGE_ID`
+1. `YOUR_DIGEST` (configured `TP_AGENT_DIGEST` or derived digest)
+
+1. Latest messages from a thread/channel:
+
+```text
+https://YOUR_DOMAIN/messages?channel_id=CHANNEL_ID&limit=5&tp_digest=YOUR_DIGEST
+```
+
+1. Exact message by message ID:
+
+```text
+https://YOUR_DOMAIN/messages?channel_id=CHANNEL_ID&message_id=MESSAGE_ID&tp_digest=YOUR_DIGEST
+```
+
+1. Include debug diagnostics:
+
+```text
+https://YOUR_DOMAIN/messages?channel_id=CHANNEL_ID&limit=5&tp_digest=YOUR_DIGEST&tp_debug=1
+```
+
+1. Include raw image chunks for text-only agents:
+
+```text
+https://YOUR_DOMAIN/messages?channel_id=CHANNEL_ID&message_id=MESSAGE_ID&tp_digest=YOUR_DIGEST&tp_image_mode=raw
+```
+
+Equivalent curl examples:
+
+```bash
+curl -sS "https://YOUR_DOMAIN/messages?channel_id=CHANNEL_ID&limit=5&tp_digest=YOUR_DIGEST"
+curl -sS "https://YOUR_DOMAIN/messages?channel_id=CHANNEL_ID&message_id=MESSAGE_ID&tp_digest=YOUR_DIGEST"
+curl -sS "https://YOUR_DOMAIN/messages?channel_id=CHANNEL_ID&message_id=MESSAGE_ID&tp_digest=YOUR_DIGEST&tp_image_mode=raw"
+```
 
 ## Quick Start
 
