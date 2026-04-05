@@ -173,7 +173,7 @@ Adjust hardcoded host paths in `.cpanel.yml` to match your cPanel environment.
 
 ## Local Operations Workflow
 
-Operational deployment and host verification scripts are intentionally kept in your local ops workspace (`C:/Data/web/ops`) rather than this project repository.
+Operational deployment and host verification scripts are intentionally kept in your local ops workspace (outside this project repository).
 
 Use the tinyPeople scripts there:
 
@@ -207,5 +207,6 @@ TP_SSH_PORT=22
 
 Set your real non-default port in local `ops/.env` via `TP_SSH_PORT` (gitignored), and keep the README command examples generic.
 The script reads `ops/.env` first (unless flags are explicitly passed), so host-specific details stay local.
+It configures SSH with `BatchMode=no` so encrypted keys prompt interactively for passphrase in the terminal.
 
 This keeps server-specific paths, SSH details, and operational runbooks out of the shared project codebase.

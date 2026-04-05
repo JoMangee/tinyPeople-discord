@@ -121,10 +121,14 @@ $env:TP_SSH_KEY_PATH = $normalizedKeyPath
 $env:TP_SSH_HOST = $HostName
 $env:TP_SSH_USER = $HostUser
 $env:TP_SSH_PORT = [string]$Port
-$env:GIT_SSH_COMMAND = "ssh -p $Port -o UserKnownHostsFile=$normalizedKnownHosts -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -i $normalizedKeyPath"
+$env:GIT_TERMINAL_PROMPT = "1"
+$env:GIT_ASKPASS = ""
+$env:SSH_ASKPASS = ""
+$env:SSH_ASKPASS_REQUIRE = "never"
+$env:GIT_SSH_COMMAND = "ssh -p $Port -o BatchMode=no -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes -o NumberOfPasswordPrompts=1 -o UserKnownHostsFile=$normalizedKnownHosts -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -i $normalizedKeyPath"
 
 if ($PersistLocalGitConfig) {
-    git -C $repoRoot config --local core.sshCommand "ssh -p $Port -o UserKnownHostsFile=$normalizedKnownHosts -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -i $normalizedKeyPath"
+    git -C $repoRoot config --local core.sshCommand "ssh -p $Port -o BatchMode=no -o UserKnownHostsFile=$normalizedKnownHosts -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -i $normalizedKeyPath"
 }
 
 Write-Host "Repo root: $repoRoot"
@@ -132,6 +136,7 @@ Write-Host "Key path:  $normalizedKeyPath"
 Write-Host "KnownHosts: $normalizedKnownHosts"
 Write-Host "Host target: $HostUser@$HostName"
 Write-Host "SSH port: $Port"
+Write-Host "Passphrase prompt mode: interactive (BatchMode=no)"
 Write-Host "GIT_SSH_COMMAND set for this shell session."
 if ($PersistLocalGitConfig) {
     Write-Host "git core.sshCommand saved in local repo config."
@@ -139,4 +144,8 @@ if ($PersistLocalGitConfig) {
 Write-Host ""
 Write-Host "Quick check:"
 Write-Host "  ssh -p $Port -i $normalizedKeyPath -o StrictHostKeyChecking=accept-new $HostUser@$HostName exit"
+Write-Host "  git -C $repoRoot ls-remote cpanel-tinyPeople"
 Write-Host "  git -C $repoRoot push cpanel-tinyPeople master"
+Write-Host ""
+Write-Host "If prompting still fails in your terminal, use this one-shot push command:"
+Write-Host "  cmd /c \"set GIT_SSH_COMMAND=ssh -p $Port -o BatchMode=no -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes -o NumberOfPasswordPrompts=1 -o UserKnownHostsFile=$normalizedKnownHosts -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -i $normalizedKeyPath && git -C $repoRoot push cpanel-tinyPeople master\""

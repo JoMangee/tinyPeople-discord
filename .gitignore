@@ -9,3 +9,4 @@ __pycache__/
 venv/
 ops/.env
 ops/known_hosts
+ops/LOCALPUSH.md
