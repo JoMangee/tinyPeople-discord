@@ -3,10 +3,19 @@ param(
     [string]$HostName = "",
     [string]$HostUser = "",
     [int]$Port = 0,
-    [bool]$PersistLocalGitConfig = $true
+    [bool]$PersistLocalGitConfig = $true,
+    [switch]$Push
 )
 
 $ErrorActionPreference = "Stop"
+
+# Environment discovery
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+$sshAgentService = Get-Service -Name ssh-agent -ErrorAction SilentlyContinue
+$sshAgentRunning = $sshAgentService -and $sshAgentService.Status -eq 'Running'
+if (-not $isAdmin -and -not $sshAgentRunning) {
+    Write-Host "INFO: Non-admin session, ssh-agent not running. Using SSH_ASKPASS dialog for passphrase."
+}
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot = Resolve-Path (Join-Path $scriptDir "..\..")
@@ -116,15 +125,14 @@ catch {
 $resolvedKeyPath = (Resolve-Path -LiteralPath $KeyPath).Path
 $normalizedKeyPath = $resolvedKeyPath -replace "\\", "/"
 $normalizedKnownHosts = $knownHosts -replace "\\", "/"
-
+$askPassPath = (Join-Path $scriptDir "ssh-askpass.bat") -replace "\\", "/"
 $env:TP_SSH_KEY_PATH = $normalizedKeyPath
 $env:TP_SSH_HOST = $HostName
 $env:TP_SSH_USER = $HostUser
 $env:TP_SSH_PORT = [string]$Port
 $env:GIT_TERMINAL_PROMPT = "1"
-$env:GIT_ASKPASS = ""
-$env:SSH_ASKPASS = ""
-$env:SSH_ASKPASS_REQUIRE = "never"
+$env:SSH_ASKPASS = $askPassPath
+$env:SSH_ASKPASS_REQUIRE = "force"
 $env:GIT_SSH_COMMAND = "ssh -p $Port -o BatchMode=no -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes -o NumberOfPasswordPrompts=1 -o UserKnownHostsFile=$normalizedKnownHosts -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -i $normalizedKeyPath"
 
 if ($PersistLocalGitConfig) {
@@ -136,16 +144,16 @@ Write-Host "Key path:  $normalizedKeyPath"
 Write-Host "KnownHosts: $normalizedKnownHosts"
 Write-Host "Host target: $HostUser@$HostName"
 Write-Host "SSH port: $Port"
-Write-Host "Passphrase prompt mode: interactive (BatchMode=no)"
+Write-Host "SSH_ASKPASS: $askPassPath"
 Write-Host "GIT_SSH_COMMAND set for this shell session."
 if ($PersistLocalGitConfig) {
     Write-Host "git core.sshCommand saved in local repo config."
 }
 Write-Host ""
-Write-Host "Quick check:"
-Write-Host "  ssh -p $Port -i $normalizedKeyPath -o StrictHostKeyChecking=accept-new $HostUser@$HostName exit"
-Write-Host "  git -C $repoRoot ls-remote cpanel-tinyPeople"
-Write-Host "  git -C $repoRoot push cpanel-tinyPeople master"
-Write-Host ""
-Write-Host "If prompting still fails in your terminal, use this one-shot push command:"
-Write-Host "  cmd /c \"set GIT_SSH_COMMAND=ssh -p $Port -o BatchMode=no -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes -o NumberOfPasswordPrompts=1 -o UserKnownHostsFile=$normalizedKnownHosts -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -i $normalizedKeyPath && git -C $repoRoot push cpanel-tinyPeople master\""
+if ($Push) {
+    Write-Host "Running: git push cpanel-tinyPeople master"
+    git -C $repoRoot push cpanel-tinyPeople master
+} else {
+    Write-Host "A GUI passphrase dialog will appear when git connects. Run:"
+    Write-Host "  git push cpanel-tinyPeople master"
+}

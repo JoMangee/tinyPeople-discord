@@ -1,0 +1,14 @@
+{
+    "terminal.integrated.profiles.windows": {
+        "tinyPeople Deploy": {
+            "source": "PowerShell",
+            "args": [
+                "-NoProfile",
+                "-NoExit",
+                "-Command",
+                ". '${workspaceFolder}\\ops\\scripts\\Use-TinyPeopleRepoEnv.ps1'"
+            ],
+            "icon": "cloud-upload"
+        }
+    }
+}

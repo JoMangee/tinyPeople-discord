@@ -1,0 +1,24 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Push to cPanel (tinyPeople)",
+            "type": "shell",
+            "command": ". .\\ops\\scripts\\Use-TinyPeopleRepoEnv.ps1; git push cpanel-tinyPeople master",
+            "options": {
+                "shell": {
+                    "executable": "pwsh",
+                    "args": ["-NoProfile", "-Command"]
+                },
+                "cwd": "${workspaceFolder}"
+            },
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "focus": true,
+                "close": false
+            },
+            "problemMatcher": []
+        }
+    ]
+}
