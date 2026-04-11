@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.2 — 2026-04-11
+
+### Added
+- Magic Link pairing flow for agent-driven OAuth: `/oauth/authorize?pairing_id=ID` now returns JSON
+  with an `authorize_url` for the user and a `claim_url` for the agent.
+- New `/oauth/claim?pairing_id=ID&tp_digest=DIGEST` endpoint: operator-authenticated one-time retrieval
+  of the API key after user authorization — no copy-pasting required.
+- `pairing_id` column added to `oauth_states` table (auto-migrated on first startup).
+
+### Changed
+- BOT_VERSION bumped to 0.3.2
+- `/oauth/key` prune loop also clears `_PAIRING_INDEX` entries.
+
+---
+
 ## 0.3.1 — 2026-04-11
 
 ### Changed

@@ -1,6 +1,6 @@
 # Install and Deploy (cPanel)
 
-**Version 0.3.1** — compatible with Python 3.12, Flask 2.3+, cPanel Passenger WSGI.
+**Version 0.3.2** — compatible with Python 3.12, Flask 2.3+, cPanel Passenger WSGI.
 
 Branding note: use `tinyPeople` in copy/UI, but keep domain and host paths lowercase in operational commands.
 

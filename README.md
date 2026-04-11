@@ -1,6 +1,6 @@
 # tinyPeople Discord Messages API
 
-**Version 0.3.1** — see [CHANGELOG.md](CHANGELOG.md) for history.
+**Version 0.3.2** — see [CHANGELOG.md](CHANGELOG.md) for history.
 
 A Flask API that reads Discord channel messages via a bot token kept server-side.
 
