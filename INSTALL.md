@@ -1,5 +1,7 @@
 # Install and Deploy (cPanel)
 
+**Version 0.3.0** — compatible with Python 3.12, Flask 2.3+, cPanel Passenger WSGI.
+
 Branding note: use `tinyPeople` in copy/UI, but keep domain and host paths lowercase in operational commands.
 
 ## 1. Prepare a new Discord application
@@ -16,22 +18,22 @@ Branding note: use `tinyPeople` in copy/UI, but keep domain and host paths lower
 
 Upload this folder to your host, for example:
 
-- `/home2/USERNAME/APPDOMAIN/`
+- `/home/USERNAME/APPDOMAIN/`
 
 ## 3. Configure Python App in cPanel
 
 Suggested:
 
 - Python version: 3.12
-- App root: `/home2/USERNAME/APPDOMAIN`
+- App root: `/home/USERNAME/APPDOMAIN`
 - Startup file: `passenger_wsgi.py`
 - URL: `https://your-domain`
 
 ## 4. Install dependencies
 
 ```bash
-cd /home2/USERNAME/APPDOMAIN
-source /home2/USERNAME/virtualenv/APPDOMAIN/3.12/bin/activate
+cd /home/USERNAME/APPDOMAIN
+source /home/USERNAME/virtualenv/APPDOMAIN/3.12/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
@@ -49,7 +51,7 @@ Do not commit `.env`.
 ## 6. Restart Passenger app
 
 ```bash
-touch /home2/USERNAME/APPDOMAIN/tmp/restart.txt
+touch /home/USERNAME/APPDOMAIN/tmp/restart.txt
 ```
 
 ## 7. Smoke test
@@ -65,9 +67,9 @@ curl -sS "https://your-domain/messages?channel_id=123456789012345678&limit=3" \
 A typical pull workflow on host:
 
 ```bash
-cd /home2/USERNAME/APPDOMAIN
+cd /home/USERNAME/APPDOMAIN
 git pull
-source /home2/USERNAME/virtualenv/APPDOMAIN/3.12/bin/activate
+source /home/USERNAME/virtualenv/APPDOMAIN/3.12/bin/activate
 python -m pip install -r requirements.txt
 touch tmp/restart.txt
 ```

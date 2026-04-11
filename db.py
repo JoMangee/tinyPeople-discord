@@ -20,6 +20,8 @@ import uuid
 from threading import Lock
 from typing import Any, NamedTuple
 
+__version__ = "0.3.0"
+
 
 class AuthContext(NamedTuple):
     """Caller identity from auth resolution."""

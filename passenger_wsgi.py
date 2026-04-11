@@ -1,4 +1,7 @@
 """Passenger WSGI entry point for tinyPeople Discord Messages API."""
+# Version tracks app.py BOT_VERSION
+__version__ = "0.3.0"
+
 import os
 import sys
 
