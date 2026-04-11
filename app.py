@@ -88,6 +88,13 @@ ALLOWED_CHANNEL_IDS = {
     for channel_id in os.getenv("ALLOWED_CHANNEL_IDS", "").split(",")
     if channel_id.strip()
 }
+# Channels accessible to every authenticated tenant (no per-tenant grant required).
+# Useful for shared/announcement channels you want all API consumers to read.
+TP_PUBLIC_CHANNEL_IDS = {
+    channel_id.strip()
+    for channel_id in os.getenv("TP_PUBLIC_CHANNEL_IDS", "").split(",")
+    if channel_id.strip()
+}
 
 # Multi-tenant rate limiting and API keys (Phase 1)
 TP_RATE_LIMIT_PER_MINUTE = int(os.getenv("TP_RATE_LIMIT_PER_MINUTE", "30"))
@@ -983,7 +990,10 @@ def get_messages() -> tuple[Any, int]:
         # Tenant-scoped channel access
         if auth_context and auth_context.tenant_id and get_db:
             db = get_db()
-            if not db.is_channel_allowed_for_tenant(auth_context.tenant_id, channel_id):
+            if (
+                channel_id not in TP_PUBLIC_CHANNEL_IDS
+                and not db.is_channel_allowed_for_tenant(auth_context.tenant_id, channel_id)
+            ):
                 raise ApiError("channel_not_allowed_for_tenant", 403)
 
         # Per-key rate limit
