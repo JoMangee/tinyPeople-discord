@@ -1,6 +1,7 @@
 .env
 .deploy-stamp.env
 .cpanel.yml.USERNAME
+.cpanel.yml.meshnet
 __pycache__/
 *.pyc
 *.pyo

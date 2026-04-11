@@ -150,10 +150,65 @@ if ($PersistLocalGitConfig) {
     Write-Host "git core.sshCommand saved in local repo config."
 }
 Write-Host ""
+
+function Invoke-SafeCpanelPush {
+    param(
+        [string]$RepoRoot,
+        [string]$RemoteName = "cpanel-tinyPeople",
+        [string]$RemoteRef = "master"
+    )
+
+    $meshnetDeployFile = Join-Path $RepoRoot ".cpanel.yml.meshnet"
+    if (-not (Test-Path -LiteralPath $meshnetDeployFile)) {
+        Write-Host "Local deploy override not found at .cpanel.yml.meshnet; pushing current branch directly."
+        git -C $RepoRoot push $RemoteName $RemoteRef
+        return
+    }
+
+    $worktreePath = Join-Path $RepoRoot ".git\cpanel-deploy-worktree"
+    $worktreeBranch = "cpanel-deploy-local"
+
+    Write-Host "Using temporary worktree deploy branch with local .cpanel.yml.meshnet overlay."
+    git -C $RepoRoot worktree prune | Out-Null
+
+    # Clean up leftovers from previous interrupted runs.
+    $existingWorktree = (git -C $RepoRoot worktree list --porcelain) -join "`n"
+    if ($existingWorktree -match [regex]::Escape($worktreePath)) {
+        git -C $RepoRoot worktree remove --force $worktreePath | Out-Null
+    }
+    $existingBranch = (git -C $RepoRoot branch --list $worktreeBranch).Trim()
+    if ($existingBranch) {
+        git -C $RepoRoot branch -D $worktreeBranch | Out-Null
+    }
+
+    git -C $RepoRoot worktree add -B $worktreeBranch $worktreePath HEAD | Out-Null
+    try {
+        Copy-Item -LiteralPath $meshnetDeployFile -Destination (Join-Path $worktreePath ".cpanel.yml") -Force
+        git -C $worktreePath add .cpanel.yml
+
+        $pending = (git -C $worktreePath status --porcelain -- .cpanel.yml).Trim()
+        if ($pending) {
+            git -C $worktreePath commit -m "cPanel local deploy overlay (non-GitHub)" | Out-Null
+        }
+
+        Write-Host "Running: git push $RemoteName HEAD:$RemoteRef"
+        git -C $worktreePath push $RemoteName HEAD:$RemoteRef
+    }
+    finally {
+        git -C $RepoRoot worktree remove --force $worktreePath | Out-Null
+        $branchStillExists = (git -C $RepoRoot branch --list $worktreeBranch).Trim()
+        if ($branchStillExists) {
+            git -C $RepoRoot branch -D $worktreeBranch | Out-Null
+        }
+    }
+}
+
 if ($Push) {
-    Write-Host "Running: git push cpanel-tinyPeople master"
-    git -C $repoRoot push cpanel-tinyPeople master
+    Invoke-SafeCpanelPush -RepoRoot $repoRoot -RemoteName "cpanel-tinyPeople" -RemoteRef "master"
 } else {
     Write-Host "A GUI passphrase dialog will appear when git connects. Run:"
-    Write-Host "  git push cpanel-tinyPeople master"
+    Write-Host "  .\ops\scripts\Use-TinyPeopleRepoEnv.ps1 -Push"
+    Write-Host ""
+    Write-Host "-Push uses a temporary local worktree branch and overlays .cpanel.yml.meshnet"
+    Write-Host "only for the cPanel push, so tracked master stays GitHub-safe."
 }

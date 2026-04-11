@@ -1,7 +1,7 @@
 ---
 deployment:
   tasks:
-    - export APPROOT=/home2/meshnet/tinypeople.mesh.net.nz
+    - export APPROOT=/home/USERNAME/APPDOMAIN
     - export LOGDIR=$APPROOT/deploy-logs
     - /bin/mkdir -p "$LOGDIR"
     - export RUNSTAMP=$(/bin/date -u '+%Y%m%dT%H%M%SZ')
@@ -25,7 +25,7 @@ deployment:
     - /bin/echo "[deploy] installing requirements" | /usr/bin/tee -a "$LOGFILE"
     - >
       /bin/bash -lc "
-      source /home2/meshnet/virtualenv/tinypeople.mesh.net.nz/3.12/bin/activate &&
+      source /home/USERNAME/virtualenv/APPDOMAIN/3.12/bin/activate &&
       python -m pip install --upgrade pip &&
       python -m pip install -r $APPROOT/requirements.txt
       " 2>&1 | /usr/bin/tee -a "$LOGFILE"
