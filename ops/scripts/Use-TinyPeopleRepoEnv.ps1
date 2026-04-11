@@ -158,20 +158,10 @@ function Invoke-SafeCpanelPush {
         [string]$RemoteRef = "master"
     )
 
-    $localDeployFile = Join-Path $RepoRoot ".cpanel.yml.local"
-    $legacyDeployFile = Join-Path $RepoRoot ".cpanel.yml.meshnet"
-    $deployOverlayFile = $null
+    $deployOverlayFile = Join-Path $RepoRoot ".cpanel.yml.local"
 
-    if (Test-Path -LiteralPath $localDeployFile) {
-        $deployOverlayFile = $localDeployFile
-    }
-    elseif (Test-Path -LiteralPath $legacyDeployFile) {
-        $deployOverlayFile = $legacyDeployFile
-        Write-Host "Found legacy .cpanel.yml.meshnet; prefer renaming it to .cpanel.yml.local."
-    }
-
-    if (-not $deployOverlayFile) {
-        Write-Host "Local deploy override not found at .cpanel.yml.local (or legacy .cpanel.yml.meshnet); pushing current branch directly."
+    if (-not (Test-Path -LiteralPath $deployOverlayFile)) {
+        Write-Host "Local deploy override not found at .cpanel.yml.local; pushing current branch directly."
         git -C $RepoRoot push $RemoteName $RemoteRef
         return
     }
@@ -221,6 +211,5 @@ if ($Push) {
     Write-Host "  .\ops\scripts\Use-TinyPeopleRepoEnv.ps1 -Push"
     Write-Host ""
     Write-Host "-Push uses a temporary local worktree branch and overlays .cpanel.yml.local"
-    Write-Host "(legacy fallback: .cpanel.yml.meshnet)"
     Write-Host "only for the cPanel push, so tracked master stays GitHub-safe."
 }
