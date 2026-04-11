@@ -1,212 +1,174 @@
 # tinyPeople Discord Messages API
 
-A minimal Flask service that exposes Discord channel messages through a shared-secret-protected HTTP endpoint.
+A Flask API that reads Discord channel messages via a bot token kept server-side.
 
-Branding note: we style the name as `tinyPeople`, but hostnames and filesystem paths in commands/config remain lowercase.
+Branding note: display name is tinyPeople; operational hostnames and filesystem paths are lowercase.
 
-## Endpoint Contract
+## Core Endpoints
 
-- URL: `https://your-domain/messages`
-- Method: `GET`
-- Query params:
-  - `channel_id` (required)
-  - `limit` (optional, default from env)
-  - `message_id` (optional, fetch exact message when provided)
-  - `tp_image_mode=raw` (optional, include base64 image chunks for text-only agents)
-- Auth:
-  - Header `X-TinyPeople-Secret: <shared_secret>`
-  - Or `Authorization: Bearer <shared_secret>`
-  - Simple digest mode: `tp_digest=<digest>` (or header `X-TinyPeople-Digest`) with `ALLOW_STATIC_DIGEST_QUERY_PARAM=1`
-  - Optional fallback (disabled by default): query param `tp_secret=<shared_secret>` when `ALLOW_SECRET_QUERY_PARAM=1`
-  - Strong mode: timestamped signature (`tp_ts`, `tp_nonce`, `tp_sig`)
-- Response:
-  - JSON array of objects with:
-    - `timestamp`
-    - `message_id`
-    - `author`
-    - `content`
-    - `attachment_urls`
-    - `image_urls`
-    - `raw_images` (only when `tp_image_mode=raw`)
+- GET /messages
+- GET /image-chunk
+- GET /health
+- GET /oauth/authorize
+- GET /oauth/callback
+- GET /oauth/key
+- GET /keys
+- GET /keys/issue
+- GET /keys/revoke
+- GET /terms
+- GET /privacy
+
+## Authentication Modes
+
+Use one mode per request.
+
+1. API key mode (multi-tenant):
+  Send tp_key in query string or X-TinyPeople-Key header.
+
+2. Shared secret mode (legacy/operator):
+  Send X-TinyPeople-Secret or Authorization Bearer.
+
+3. Static digest mode (agent-friendly):
+  Send tp_digest (or X-TinyPeople-Digest) when ALLOW_STATIC_DIGEST_QUERY_PARAM=1.
+
+4. Signed request mode (strongest):
+  Send tp_ts, tp_nonce, tp_sig where tp_sig is HMAC-SHA256 over canonical payload.
+
+If REQUIRE_SIGNED_AUTH=1, only signed requests are accepted for legacy auth paths.
+
+## Messages API
+
+GET /messages accepts either:
+
+- channel_id (required if discord_url absent)
+- discord_url in Discord copy-link format:
+  https://discord.com/channels/GUILD_ID/CHANNEL_ID
+  https://discord.com/channels/GUILD_ID/CHANNEL_ID/MESSAGE_ID
+
+Optional query params:
+
+- limit (default from env)
+- message_id (exact message fetch)
+- tp_image_mode=raw (include base64 image chunks)
+- tp_debug=1 (when ALLOW_DEBUG_QUERY_PARAM=1)
+
+API key requests are tenant-scoped. A key can only access channels granted to its tenant.
+
+## Key Lifecycle API (Tenant Scoped)
+
+All key lifecycle routes require a valid tenant API key in tp_key (or X-TinyPeople-Key).
+
+1. List keys:
+  GET /keys
+  Optional: include_revoked=1
+
+2. Issue a new key:
+  GET /keys/issue
+  Returns a new raw api_key once.
+
+3. Revoke a key:
+  GET /keys/revoke?key_id=YOUR_KEY_ID
+  Safety rule: cannot revoke the caller key if it is the tenant's last active key.
+
+## OAuth Install Flow
+
+Enable with TP_OAUTH_ENABLED=1 and Discord OAuth settings in .env.
+
+1. User starts install:
+  GET /oauth/authorize
+
+2. Discord redirects back:
+  GET /oauth/callback
+
+3. Retrieve key once:
+  GET /oauth/key?token=SHOW_ONCE_TOKEN
+
+The raw API key is only retrievable once and is not stored in plaintext.
+
+## Health and Telemetry
+
+GET /health always returns safe server-load telemetry:
+
+- messages_telemetry.requests_in_window
+- messages_telemetry.request_rate_per_minute
+- messages_telemetry.unique_hosts_in_window
+
+If tp_key is supplied and valid, /health also returns key-specific limit status:
+
+- rate_limit.max_requests
+- rate_limit.window_seconds
+- rate_limit.requests_in_window
+- rate_limit.remaining_requests
+- rate_limit.reset_in_seconds
+
+If legacy auth is supplied and valid, /health includes operator signals such as has_discord_token and has_shared_secret.
 
 ## Raw Image Mode
 
-For text-only agents that can process chunked payloads, request raw image data:
+For text-only clients, set tp_image_mode=raw on /messages.
 
-```text
-/messages?...&tp_image_mode=raw
-```
+Each raw_images entry contains:
 
-Each `raw_images` item includes:
+- encoding (base64)
+- chunk_chars
+- chunk_count
+- chunks (ordered base64 segments)
 
-1. `encoding` (`base64`)
-1. `chunk_chars` and `chunk_count`
-1. `chunks` array (base64 segments in order)
+Use /image-chunk for on-demand chunk fetch by URL and index.
 
-Limits are controlled by `RAW_IMAGE_MODE_MAX_BYTES`, `RAW_IMAGE_CHUNK_CHARS`, and `RAW_IMAGE_MAX_ATTACHMENTS`.
+## Minimal Examples
 
-## Why this keeps token at arm's length
-
-- The external agent only knows the shared secret.
-- Discord bot token stays server-side in `.env`.
-- The service does not return or log token values.
-- Optional `ALLOWED_CHANNEL_IDS` can constrain what channel IDs are queryable.
-- Keep `ALLOW_SECRET_QUERY_PARAM=0` unless required, because query strings may be logged by proxies and web servers.
-
-## Health Telemetry
-
-`/health` includes a `messages_telemetry` object with in-memory rolling stats:
-
-1. `requests_in_window`: number of `/messages` requests in the recent window.
-1. `request_rate_per_minute`: normalized rate derived from that window.
-1. `unique_hosts_in_window`: number of unique client IPs seen recently.
-
-Tune window sizes with `METRICS_WINDOW_SECONDS` and `UNIQUE_HOST_WINDOW_SECONDS`.
-
-## Debug Query Mode
-
-For targeted troubleshooting, enable `ALLOW_DEBUG_QUERY_PARAM=1` and call:
-
-```text
-/messages?...&tp_debug=1
-```
-
-When enabled, responses include a `debug` object with non-secret diagnostics such as Discord upstream status/code and thread access hints.
-
-## Agent-Friendly Auth Options
-
-Use one of these based on what your client can do.
-
-1. Easiest (no crypto on client): set `TP_AGENT_DIGEST` in `.env` to a random long value, and have the client send `tp_digest=<that_exact_value>`.
-
-1. Simple derived digest (one-time setup): set `TP_DIGEST_SALT` and `TP_SHARED_SECRET`, compute digest once as `sha256("<salt>:<shared_secret>")`, and have the client send that as `tp_digest`.
-
-1. Strong signed requests (recommended for capable clients): send `tp_ts`, `tp_nonce`, and `tp_sig` where `tp_sig` is HMAC-SHA256 over the canonical payload; optionally enforce this mode with `REQUIRE_SIGNED_AUTH=1`.
-
-## Example URLs (Digest Mode)
-
-Replace placeholders with your values:
-
-1. `YOUR_DOMAIN` (for example `api.example.com`)
-1. `CHANNEL_ID`
-1. `MESSAGE_ID`
-1. `YOUR_DIGEST` (configured `TP_AGENT_DIGEST` or derived digest)
-
-1. Latest messages from a thread/channel:
+Digest mode:
 
 ```text
 https://YOUR_DOMAIN/messages?channel_id=CHANNEL_ID&limit=5&tp_digest=YOUR_DIGEST
 ```
 
-1. Exact message by message ID:
+Discord URL mode with API key:
 
 ```text
-https://YOUR_DOMAIN/messages?channel_id=CHANNEL_ID&message_id=MESSAGE_ID&tp_digest=YOUR_DIGEST
+https://YOUR_DOMAIN/messages?discord_url=https://discord.com/channels/GUILD_ID/CHANNEL_ID/MESSAGE_ID&tp_key=YOUR_API_KEY
 ```
 
-1. Include debug diagnostics:
+Health with key budget info:
 
 ```text
-https://YOUR_DOMAIN/messages?channel_id=CHANNEL_ID&limit=5&tp_digest=YOUR_DIGEST&tp_debug=1
+https://YOUR_DOMAIN/health?tp_key=YOUR_API_KEY
 ```
 
-1. Include raw image chunks for text-only agents:
+## Discord Developer Portal URLs
 
-```text
-https://YOUR_DOMAIN/messages?channel_id=CHANNEL_ID&message_id=MESSAGE_ID&tp_digest=YOUR_DIGEST&tp_image_mode=raw
-```
+- Terms of Service URL: https://YOUR_DOMAIN/terms
+- Privacy Policy URL: https://YOUR_DOMAIN/privacy
+- Interactions Endpoint URL: leave blank unless implementing interaction webhooks
+- Linked Roles Verification URL: leave blank unless implementing linked roles verification
 
-Equivalent curl examples:
+## Environment
+
+Start from .env.example and set production values for:
+
+- DISCORD_TOKEN
+- TP_SHARED_SECRET
+- TP_ENABLE_API_KEYS
+- TP_DB_PATH
+- TP_OAUTH_ENABLED
+- DISCORD_CLIENT_ID
+- DISCORD_CLIENT_SECRET
+- DISCORD_OAUTH_REDIRECT_URI
+- TP_SERVICE_NAME
+- TP_BASE_URL
+- TP_CONTACT_EMAIL
+
+## Local Run
 
 ```bash
-curl -sS "https://YOUR_DOMAIN/messages?channel_id=CHANNEL_ID&limit=5&tp_digest=YOUR_DIGEST"
-curl -sS "https://YOUR_DOMAIN/messages?channel_id=CHANNEL_ID&message_id=MESSAGE_ID&tp_digest=YOUR_DIGEST"
-curl -sS "https://YOUR_DOMAIN/messages?channel_id=CHANNEL_ID&message_id=MESSAGE_ID&tp_digest=YOUR_DIGEST&tp_image_mode=raw"
+pip install -r requirements.txt
+cp .env.example .env
+python app.py
 ```
 
-## Quick Start
+## Deployment Notes
 
-1. Create and activate virtual environment.
-2. Install dependencies:
-
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-3. Copy env template and set real secrets:
-
-   ```bash
-   cp .env.example .env
-   ```
-
-4. Run locally:
-
-   ```bash
-   python app.py
-   ```
-
-5. Test endpoint:
-
-   ```bash
-   curl -sS "http://127.0.0.1:8080/messages?channel_id=123456789012345678&limit=5" \
-     -H "X-TinyPeople-Secret: your_shared_secret"
-   ```
-
-   Headerless client compatibility test:
-
-   ```bash
-   ALLOW_SECRET_QUERY_PARAM=1 python app.py
-   curl -sS "http://127.0.0.1:8080/messages?channel_id=123456789012345678&limit=5&tp_secret=your_shared_secret"
-   ```
-
-## Deploy Pattern
-
-This project mirrors the existing USERNAME pattern:
-
-- Git push/pull deploy style
-- `.cpanel.yml` deployment tasks
-- runtime stamp in `.deploy-stamp.env`
-- Passenger app via `passenger_wsgi.py`
-- host logs in `deploy-logs/cpanel-deploy-latest.log`
-
-Adjust hardcoded host paths in `.cpanel.yml` to match your cPanel environment.
-
-## Local Operations Workflow
-
-Operational deployment and host verification scripts are intentionally kept in your local ops workspace (outside this project repository).
-
-Use the tinyPeople scripts there:
-
-- `scripts/deploy-tinyPeople-cpanel.ps1`
-- `scripts/deploy-tinyPeople-cpanel.sh`
-- `scripts/verify-tinyPeople-deploy.ps1`
-- `scripts/verify-tinyPeople-deploy.sh`
-
-For this repository, you can also bootstrap a reliable local PowerShell SSH environment with:
-
-```powershell
-.\ops\scripts\Use-TinyPeopleRepoEnv.ps1
-```
-
-That script ensures `~/.ssh/known_hosts` exists, sets `GIT_SSH_COMMAND` in-session, and writes local repo `core.sshCommand`.
-If your home `.ssh` path is blocked, it automatically falls back to `.git/known_hosts` inside this repo.
-If your host uses a non-default SSH port, pass it explicitly:
-
-```powershell
-.\ops\scripts\Use-TinyPeopleRepoEnv.ps1 -Port 22
-```
-
-For local-only host settings, put values in `ops/.env` (already gitignored):
-
-```text
-TP_SSH_KEY_PATH=C:/path/to/private_key
-TP_SSH_HOST=example.com
-TP_SSH_USER=user
-TP_SSH_PORT=22
-```
-
-Set your real non-default port in local `ops/.env` via `TP_SSH_PORT` (gitignored), and keep the README command examples generic.
-The script reads `ops/.env` first (unless flags are explicitly passed), so host-specific details stay local.
-It configures SSH with `BatchMode=no` so encrypted keys prompt interactively for passphrase in the terminal.
-
-This keeps server-specific paths, SSH details, and operational runbooks out of the shared project codebase.
+- Passenger entrypoint: passenger_wsgi.py
+- Keep host-specific secrets and SSH details in local gitignored files only.
+- Use ops/scripts/Use-TinyPeopleRepoEnv.ps1 for repository-local SSH environment setup.
