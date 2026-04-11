@@ -183,6 +183,11 @@ def _error_guidance(error_code: str) -> dict[str, Any] | None:
             "hint": "Provide a valid tenant key as tp_key (or X-TinyPeople-Key).",
             "next_step": "Run /oauth/authorize to mint a new key, then retry with ?tp_key=...",
         }
+    if error_code == "channel_not_allowed_for_tenant":
+        return {
+            "hint": "This key is valid, but the requested channel is not granted for this tenant.",
+            "next_step": "Grant access with /channels/grant?channel_id=... (or add channel to TP_PUBLIC_CHANNEL_IDS).",
+        }
     return None
 
 
@@ -1574,6 +1579,128 @@ def revoke_key() -> tuple[Any, int]:
             "status": "revoked",
             "key_id": target_key_id,
             "active_key_count": db.count_active_api_keys(auth_context.tenant_id),
+        }
+    ), 200
+
+
+@app.route("/channels/list", methods=["GET"])
+def list_channels() -> tuple[Any, int]:
+    """List tenant channel grants and globally public channels."""
+    try:
+        auth_context = _require_tenant_api_key_context()
+    except ApiError as exc:
+        return jsonify({"error": exc.message}), exc.status_code
+
+    db = get_db()
+    grants = db.list_channel_grants_for_tenant(auth_context.tenant_id)
+    public_ids = sorted(TP_PUBLIC_CHANNEL_IDS)
+
+    return jsonify(
+        {
+            "tenant_id": auth_context.tenant_id,
+            "public_channel_ids": public_ids,
+            "grants": grants,
+            "grant_count": len(grants),
+            "effective_channel_count": len({item["channel_id"] for item in grants}.union(public_ids)),
+        }
+    ), 200
+
+
+@app.route("/channels/grant", methods=["GET"])
+def grant_channel() -> tuple[Any, int]:
+    """Grant a channel to the caller's tenant allowlist. Requires tenant API key."""
+    try:
+        auth_context = _require_tenant_api_key_context()
+    except ApiError as exc:
+        return jsonify({"error": exc.message}), exc.status_code
+
+    channel_id_raw = request.args.get("channel_id")
+    try:
+        channel_id = _validate_channel_id(channel_id_raw)
+    except ApiError as exc:
+        payload = {"error": exc.message}
+        guidance = _error_guidance(exc.message)
+        if guidance:
+            payload.update(guidance)
+        return jsonify(payload), exc.status_code
+
+    db = get_db()
+    already_allowed = (
+        channel_id in TP_PUBLIC_CHANNEL_IDS
+        or db.is_channel_allowed_for_tenant(auth_context.tenant_id, channel_id)
+    )
+
+    if channel_id not in TP_PUBLIC_CHANNEL_IDS:
+        db.add_channel_grant(auth_context.tenant_id, channel_id)
+
+    db.audit_log(
+        caller_id=auth_context.caller_id,
+        action="grant_channel",
+        status=200,
+        latency_ms=0,
+        tenant_id=auth_context.tenant_id,
+        key_id=auth_context.key_id,
+        channel_id=channel_id,
+    )
+
+    return jsonify(
+        {
+            "status": "already_allowed" if already_allowed else "granted",
+            "tenant_id": auth_context.tenant_id,
+            "channel_id": channel_id,
+            "is_public_channel": channel_id in TP_PUBLIC_CHANNEL_IDS,
+            "hint": "Use this channel_id with /messages via channel_id=... or discord_url=...",
+        }
+    ), 200
+
+
+@app.route("/channels/revoke", methods=["GET"])
+def revoke_channel() -> tuple[Any, int]:
+    """Revoke a channel grant from caller tenant. Public channels are not revocable here."""
+    try:
+        auth_context = _require_tenant_api_key_context()
+    except ApiError as exc:
+        return jsonify({"error": exc.message}), exc.status_code
+
+    channel_id_raw = request.args.get("channel_id")
+    try:
+        channel_id = _validate_channel_id(channel_id_raw)
+    except ApiError as exc:
+        payload = {"error": exc.message}
+        guidance = _error_guidance(exc.message)
+        if guidance:
+            payload.update(guidance)
+        return jsonify(payload), exc.status_code
+
+    if channel_id in TP_PUBLIC_CHANNEL_IDS:
+        return jsonify(
+            {
+                "error": "channel_is_globally_public",
+                "hint": "This channel is allowed via TP_PUBLIC_CHANNEL_IDS and is not tenant-scoped.",
+            }
+        ), 409
+
+    db = get_db()
+    removed = db.remove_channel_grant(auth_context.tenant_id, channel_id)
+
+    db.audit_log(
+        caller_id=auth_context.caller_id,
+        action="revoke_channel",
+        status=200 if removed else 404,
+        latency_ms=0,
+        tenant_id=auth_context.tenant_id,
+        key_id=auth_context.key_id,
+        channel_id=channel_id,
+    )
+
+    if not removed:
+        return jsonify({"status": "not_found", "channel_id": channel_id}), 404
+
+    return jsonify(
+        {
+            "status": "revoked",
+            "tenant_id": auth_context.tenant_id,
+            "channel_id": channel_id,
         }
     ), 200
 
