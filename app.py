@@ -31,7 +31,7 @@ except ImportError:
     init_db = None
     AuthContext = None
 
-BOT_VERSION = "0.2.0"
+BOT_VERSION = "0.3.0"
 APP_DIR = os.path.dirname(__file__)
 load_dotenv(os.path.join(APP_DIR, ".env"))
 load_dotenv(os.path.join(APP_DIR, ".deploy-stamp.env"))
@@ -158,6 +158,17 @@ def _resolve_auth_context() -> tuple[Any, bool]:
         auth_mode="api_key",
     )
     return context, True
+
+
+def _require_tenant_api_key_context() -> Any:
+    """Require a valid tenant-scoped API key and return its auth context."""
+    if not (get_db and TP_ENABLE_API_KEYS):
+        raise ApiError("api_keys_not_enabled", 503)
+
+    auth_context, is_key_based = _resolve_auth_context()
+    if not (auth_context and is_key_based and auth_context.tenant_id and auth_context.key_id):
+        raise ApiError("missing_api_key", 401)
+    return auth_context
 
 
 def _debug_requested() -> bool:
@@ -759,22 +770,69 @@ def home() -> tuple[Any, int]:
 
 @app.route("/health")
 def health() -> tuple[Any, int]:
-    """Health endpoint for host checks."""
-    return (
-        jsonify(
+    """Health endpoint with public load stats and auth-gated detail."""
+    payload: dict[str, Any] = {
+        "status": "healthy",
+        "version": BOT_VERSION,
+        "revision": APP_REVISION,
+        "build": APP_BUILD,
+        "runtime_signature": APP_RUNTIME_SIGNATURE,
+        "messages_telemetry": _message_metrics_snapshot(),
+    }
+
+    # If an API key is supplied, validate it and include tenant + key budget info.
+    key_supplied = bool(
+        request.headers.get("X-TinyPeople-Key", "").strip()
+        or request.args.get("tp_key", "").strip()
+    )
+    if key_supplied:
+        try:
+            auth_context = _require_tenant_api_key_context()
+        except ApiError as exc:
+            return jsonify({"error": exc.message}), exc.status_code
+
+        db = get_db()
+        usage = db.get_rate_limit_usage(
+            auth_context.key_id,
+            window_seconds=TP_RATE_LIMIT_WINDOW_SECONDS,
+        )
+        remaining = max(0, TP_RATE_LIMIT_PER_MINUTE - usage["requests_in_window"])
+
+        payload.update(
             {
-                "status": "healthy",
-                "version": BOT_VERSION,
-                "revision": APP_REVISION,
-                "build": APP_BUILD,
-                "runtime_signature": APP_RUNTIME_SIGNATURE,
+                "auth_mode": "api_key",
+                "tenant_id": auth_context.tenant_id,
+                "key_id": auth_context.key_id,
+                "rate_limit": {
+                    "max_requests": TP_RATE_LIMIT_PER_MINUTE,
+                    "window_seconds": TP_RATE_LIMIT_WINDOW_SECONDS,
+                    "requests_in_window": usage["requests_in_window"],
+                    "remaining_requests": remaining,
+                    "reset_in_seconds": usage["reset_in_seconds"],
+                },
+            }
+        )
+        return jsonify(payload), 200
+
+    # Operator details require legacy auth; without auth, keep health minimal.
+    legacy_supplied = bool(
+        _resolve_secret_from_request() or _resolve_digest_from_request() or _has_signed_auth_material()
+    )
+    if legacy_supplied:
+        try:
+            _authorize_request("0", 1)
+        except ApiError as exc:
+            return jsonify({"error": exc.message}), exc.status_code
+
+        payload.update(
+            {
+                "auth_mode": "operator",
                 "has_discord_token": bool(DISCORD_TOKEN),
                 "has_shared_secret": bool(TP_SHARED_SECRET),
-                "messages_telemetry": _message_metrics_snapshot(),
             }
-        ),
-        200,
-    )
+        )
+
+    return jsonify(payload), 200
 
 
 @app.route("/messages", methods=["GET"])
@@ -1180,6 +1238,123 @@ def oauth_key() -> tuple[Any, int]:
         ),
         "example_url": f"/messages?discord_url=https://discord.com/channels/{entry['guild_id']}/CHANNEL_ID&tp_key={entry['raw_key']}",
     }), 200
+
+
+@app.route("/keys", methods=["GET"])
+def list_keys() -> tuple[Any, int]:
+    """List keys for the caller's tenant. Requires a tenant API key."""
+    try:
+        auth_context = _require_tenant_api_key_context()
+    except ApiError as exc:
+        return jsonify({"error": exc.message}), exc.status_code
+
+    include_revoked = request.args.get("include_revoked", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+    db = get_db()
+    keys = db.list_api_keys_for_tenant(
+        auth_context.tenant_id,
+        include_revoked=include_revoked,
+    )
+    active_count = db.count_active_api_keys(auth_context.tenant_id)
+
+    return jsonify(
+        {
+            "tenant_id": auth_context.tenant_id,
+            "active_key_count": active_count,
+            "keys": keys,
+        }
+    ), 200
+
+
+@app.route("/keys/issue", methods=["GET"])
+def issue_key() -> tuple[Any, int]:
+    """Issue a new API key for the caller's tenant. Requires a tenant API key."""
+    try:
+        auth_context = _require_tenant_api_key_context()
+    except ApiError as exc:
+        return jsonify({"error": exc.message}), exc.status_code
+
+    db = get_db()
+    key_id, raw_key = db.mint_api_key(auth_context.tenant_id)
+
+    db.audit_log(
+        caller_id=auth_context.caller_id,
+        action="issue_key",
+        status=200,
+        latency_ms=0,
+        tenant_id=auth_context.tenant_id,
+        key_id=auth_context.key_id,
+    )
+
+    return jsonify(
+        {
+            "status": "issued",
+            "tenant_id": auth_context.tenant_id,
+            "key_id": key_id,
+            "api_key": raw_key,
+            "warning": "Store this key now. Raw keys are never recoverable from the server.",
+        }
+    ), 200
+
+
+@app.route("/keys/revoke", methods=["GET"])
+def revoke_key() -> tuple[Any, int]:
+    """Revoke a tenant API key by key_id. Requires a tenant API key."""
+    try:
+        auth_context = _require_tenant_api_key_context()
+    except ApiError as exc:
+        return jsonify({"error": exc.message}), exc.status_code
+
+    target_key_id = request.args.get("key_id", "").strip()
+    if not target_key_id:
+        return jsonify({"error": "missing_key_id"}), 400
+
+    db = get_db()
+    keys = db.list_api_keys_for_tenant(auth_context.tenant_id, include_revoked=True)
+    target = next((item for item in keys if item["key_id"] == target_key_id), None)
+    if not target:
+        return jsonify({"error": "key_not_found"}), 404
+
+    if target.get("revoked_at") is not None:
+        return jsonify({"status": "already_revoked", "key_id": target_key_id}), 200
+
+    active_count = db.count_active_api_keys(auth_context.tenant_id)
+    if target_key_id == auth_context.key_id and active_count <= 1:
+        return (
+            jsonify(
+                {
+                    "error": "cannot_revoke_last_active_key",
+                    "hint": "Issue a replacement key first via /keys/issue.",
+                }
+            ),
+            409,
+        )
+
+    revoked = db.revoke_api_key(auth_context.tenant_id, target_key_id)
+    if not revoked:
+        return jsonify({"error": "key_not_active"}), 409
+
+    db.audit_log(
+        caller_id=auth_context.caller_id,
+        action="revoke_key",
+        status=200,
+        latency_ms=0,
+        tenant_id=auth_context.tenant_id,
+        key_id=auth_context.key_id,
+    )
+
+    return jsonify(
+        {
+            "status": "revoked",
+            "key_id": target_key_id,
+            "active_key_count": db.count_active_api_keys(auth_context.tenant_id),
+        }
+    ), 200
 
 
 @app.route("/terms")

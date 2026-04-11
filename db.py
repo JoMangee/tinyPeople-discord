@@ -266,6 +266,35 @@ class Database:
             conn.commit()
             return True
 
+    def get_rate_limit_usage(self, key_id: str, window_seconds: int) -> dict[str, int]:
+        """Return request usage for a key in the active rolling window."""
+        now = int(time.time())
+        cutoff = now - window_seconds
+        conn = self._get_conn()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT COALESCE(SUM(request_count), 0), MIN(window_start)
+            FROM rate_limit_buckets
+            WHERE key_id = ? AND window_start >= ?
+            """,
+            (key_id, cutoff),
+        )
+        row = cursor.fetchone()
+        requests_in_window = int(row[0]) if row and row[0] is not None else 0
+        oldest_window_start = int(row[1]) if row and row[1] is not None else 0
+
+        reset_in_seconds = 0
+        if oldest_window_start > 0:
+            reset_in_seconds = max(0, window_seconds - (now - oldest_window_start))
+
+        return {
+            "requests_in_window": requests_in_window,
+            "window_seconds": window_seconds,
+            "reset_in_seconds": reset_in_seconds,
+        }
+
     def audit_log(
         self,
         caller_id: str,
@@ -334,6 +363,78 @@ class Database:
         )
         conn.commit()
         return key_id, raw_key
+
+    def list_api_keys_for_tenant(
+        self,
+        tenant_id: str,
+        include_revoked: bool = False,
+    ) -> list[dict[str, Any]]:
+        """List API keys for a tenant, optionally including revoked keys."""
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        if include_revoked:
+            cursor.execute(
+                """
+                SELECT key_id, tenant_id, created_at, updated_at, revoked_at
+                FROM api_keys
+                WHERE tenant_id = ?
+                ORDER BY created_at DESC
+                """,
+                (tenant_id,),
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT key_id, tenant_id, created_at, updated_at, revoked_at
+                FROM api_keys
+                WHERE tenant_id = ? AND revoked_at IS NULL
+                ORDER BY created_at DESC
+                """,
+                (tenant_id,),
+            )
+
+        rows = cursor.fetchall()
+        return [
+            {
+                "key_id": row[0],
+                "tenant_id": row[1],
+                "created_at": row[2],
+                "updated_at": row[3],
+                "revoked_at": row[4],
+            }
+            for row in rows
+        ]
+
+    def count_active_api_keys(self, tenant_id: str) -> int:
+        """Return number of active (non-revoked) keys for a tenant."""
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM api_keys
+            WHERE tenant_id = ? AND revoked_at IS NULL
+            """,
+            (tenant_id,),
+        )
+        row = cursor.fetchone()
+        return int(row[0]) if row else 0
+
+    def revoke_api_key(self, tenant_id: str, key_id: str) -> bool:
+        """Revoke a tenant key. Returns True if a live key was revoked."""
+        now = int(time.time())
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE api_keys
+            SET revoked_at = ?, updated_at = ?
+            WHERE tenant_id = ? AND key_id = ? AND revoked_at IS NULL
+            """,
+            (now, now, tenant_id, key_id),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
 
     def add_channel_grant(self, tenant_id: str, channel_id: str) -> None:
         """Add a channel to a tenant's allowlist (idempotent)."""
