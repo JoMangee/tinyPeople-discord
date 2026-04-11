@@ -12,6 +12,8 @@ from collections import deque
 import hmac
 import hashlib
 import os
+import re
+import secrets
 from threading import Lock
 import time
 from dataclasses import dataclass
@@ -95,7 +97,22 @@ TP_ENABLE_API_KEYS = (
     in {"1", "true", "yes", "on"}
 )
 
+# Discord OAuth (Phase 2)
+DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID", "").strip()
+DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "").strip()
+DISCORD_OAUTH_REDIRECT_URI = os.getenv("DISCORD_OAUTH_REDIRECT_URI", "").strip()
+# View Channel (1024) + Read Message History (65536)
+DISCORD_BOT_PERMISSIONS = os.getenv("DISCORD_BOT_PERMISSIONS", "66560").strip()
+TP_OAUTH_ENABLED = (
+    os.getenv("TP_OAUTH_ENABLED", "0").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+
 app = Flask(__name__)
+
+# Show-once token store: raw key is held here briefly after OAuth then discarded.
+# Maps one-time token -> {raw_key, guild_id, expires_at}
+_SHOW_ONCE: dict[str, dict] = {}
 RECENT_NONCES: dict[str, int] = {}
 MESSAGE_REQUEST_TIMESTAMPS: deque[int] = deque()
 MESSAGE_HOST_SEEN_AT: dict[str, int] = {}
@@ -128,16 +145,16 @@ def _resolve_auth_context() -> tuple[Any, bool]:
     if not api_key:
         return None, False
 
-    # API key provided; validate it
+    # API key provided; validate it via hash comparison (raw key never stored)
     db = get_db()
-    key_info = db.get_api_key(api_key)
+    key_info = db.get_api_key_by_raw(api_key)
     if not key_info:
         raise ApiError("invalid_api_key", 403)
-    
+
     context = AuthContext(
-        caller_id=api_key,
+        caller_id=key_info["key_id"],
         tenant_id=key_info["tenant_id"],
-        key_id=api_key,
+        key_id=key_info["key_id"],
         auth_mode="api_key",
     )
     return context, True
@@ -150,6 +167,40 @@ def _debug_requested() -> bool:
 
     raw = request.args.get("tp_debug", "").strip().lower()
     return raw in {"1", "true", "yes", "on"}
+
+
+_DISCORD_CHANNEL_URL_RE = re.compile(
+    r"https?://(?:www\.)?discord\.com/channels/(?P<guild>\d+)/(?P<channel>\d+)(?:/(?P<message>\d+))?"
+)
+
+
+def _parse_discord_url(url: str) -> tuple[str, str, str | None] | None:
+    """Parse a Discord channel/message URL into (guild_id, channel_id, message_id|None).
+    
+    Accepts:
+      https://discord.com/channels/GUILD/CHANNEL
+      https://discord.com/channels/GUILD/CHANNEL/MESSAGE
+    Returns None if the URL doesn't match.
+    """
+    m = _DISCORD_CHANNEL_URL_RE.match(url.strip())
+    if not m:
+        return None
+    return m.group("guild"), m.group("channel"), m.group("message")
+
+
+def _build_oauth_install_url() -> str | None:
+    """Build the Discord bot OAuth install URL, or None if OAuth not configured."""
+    if not (DISCORD_CLIENT_ID and DISCORD_OAUTH_REDIRECT_URI):
+        return None
+    # scope: bot (adds bot to guild) + identify (so we can read installer's identity)
+    return (
+        f"https://discord.com/oauth2/authorize"
+        f"?client_id={DISCORD_CLIENT_ID}"
+        f"&permissions={DISCORD_BOT_PERMISSIONS}"
+        f"&redirect_uri={DISCORD_OAUTH_REDIRECT_URI}"
+        f"&response_type=code"
+        f"&scope=bot+identify"
+    )
 
 
 def _raw_image_mode_requested() -> bool:
@@ -728,35 +779,64 @@ def health() -> tuple[Any, int]:
 
 @app.route("/messages", methods=["GET"])
 def get_messages() -> tuple[Any, int]:
-    """Return latest messages for a Discord channel by channel ID."""
+    """Return latest messages for a Discord channel by channel ID.
+    
+    Accepts channel_id + optional message_id, OR a raw discord_url:
+      ?discord_url=https://discord.com/channels/GUILD/CHANNEL/MESSAGE
+    When discord_url is provided, guild is validated against tenant ownership.
+    """
     start_time = time.time()
     debug_enabled = _debug_requested()
     raw_image_mode = _raw_image_mode_requested()
     _record_message_request()
-    
+
     auth_context = None
     channel_id = None
-    
+
     try:
-        # Try to resolve API key / tenant auth context (new)
+        # Resolve API key / tenant auth context (new)
         auth_context, is_key_based = _resolve_auth_context()
-        
-        # Parse and validate parameters
-        channel_id = _validate_channel_id(request.args.get("channel_id"))
-        message_id = _validate_message_id(request.args.get("message_id"))
+
+        # Parse discord_url shorthand if provided
+        discord_url = request.args.get("discord_url", "").strip()
+        if discord_url:
+            parsed = _parse_discord_url(discord_url)
+            if not parsed:
+                raise ApiError("invalid_discord_url", 400)
+            url_guild_id, url_channel_id, url_message_id = parsed
+            # If using a tenant key, ensure guild matches
+            if auth_context and auth_context.tenant_id:
+                db = get_db()
+                tenant = db.get_tenant_by_guild(url_guild_id)
+                if not tenant or tenant["tenant_id"] != auth_context.tenant_id:
+                    oauth_url = _build_oauth_install_url()
+                    raise ApiError(
+                        "guild_not_associated_with_key",
+                        403,
+                        debug={"guild_id": url_guild_id, "install_url": oauth_url},
+                    )
+            # Inject extracted params
+            channel_id_raw = url_channel_id
+            message_id_raw = url_message_id
+        else:
+            channel_id_raw = request.args.get("channel_id")
+            message_id_raw = request.args.get("message_id")
+
+        channel_id = _validate_channel_id(channel_id_raw)
+        message_id = _validate_message_id(message_id_raw)
         limit = _parse_limit(request.args.get("limit"))
-        
-        # If no API key, fall through to legacy shared-secret auth
+
+        # Legacy auth if no API key was used
         if not is_key_based:
             _authorize_request(channel_id, limit)
-        
-        # Check tenant-scoped channel access if applicable
+
+        # Tenant-scoped channel access
         if auth_context and auth_context.tenant_id and get_db:
             db = get_db()
             if not db.is_channel_allowed_for_tenant(auth_context.tenant_id, channel_id):
                 raise ApiError("channel_not_allowed_for_tenant", 403)
-        
-        # Check rate limit if using API key
+
+        # Per-key rate limit
         if auth_context and auth_context.key_id and get_db:
             db = get_db()
             if not db.check_and_record_rate_limit(
@@ -765,8 +845,8 @@ def get_messages() -> tuple[Any, int]:
                 window_seconds=TP_RATE_LIMIT_WINDOW_SECONDS,
             ):
                 raise ApiError("rate_limit_exceeded", 429)
-        
-        # Fetch messages
+
+        # Fetch from Discord
         if message_id:
             messages = [
                 _fetch_discord_message_by_id(
@@ -777,12 +857,11 @@ def get_messages() -> tuple[Any, int]:
             messages = _fetch_discord_messages(
                 channel_id, limit, include_raw_images=raw_image_mode
             )
-        
-        # Log successful request (audit)
+
+        # Audit log
         if auth_context and get_db:
             latency_ms = int((time.time() - start_time) * 1000)
-            db = get_db()
-            db.audit_log(
+            get_db().audit_log(
                 caller_id=auth_context.caller_id,
                 action="fetch_messages",
                 status=200,
@@ -791,13 +870,11 @@ def get_messages() -> tuple[Any, int]:
                 key_id=auth_context.key_id,
                 channel_id=channel_id,
             )
-        
+
     except ApiError as exc:
-        # Log error (audit)
         if auth_context and get_db:
             latency_ms = int((time.time() - start_time) * 1000)
-            db = get_db()
-            db.audit_log(
+            get_db().audit_log(
                 caller_id=auth_context.caller_id,
                 action="fetch_messages",
                 status=exc.status_code,
@@ -806,11 +883,22 @@ def get_messages() -> tuple[Any, int]:
                 key_id=auth_context.key_id,
                 channel_id=channel_id or request.args.get("channel_id", ""),
             )
-        
+
         payload: dict[str, Any] = {"error": exc.message}
+
+        # Attach install URL for any bot-permission or auth error so
+        # agents and users know exactly what action to take next.
+        oauth_url = _build_oauth_install_url()
+        if oauth_url and exc.status_code in (401, 403, 503):
+            payload["install_url"] = oauth_url
+            payload["install_hint"] = (
+                "Add this bot to your Discord server using the install_url, "
+                "then request an API key to access your channels."
+            )
+
         if debug_enabled:
             payload["debug"] = {
-                "channel_id": request.args.get("channel_id", ""),
+                "channel_id": channel_id or request.args.get("channel_id", ""),
                 "message_id": request.args.get("message_id", ""),
                 "image_mode": request.args.get("tp_image_mode", "")
                 or request.args.get("image_mode", ""),
@@ -905,6 +993,192 @@ def get_image_chunk() -> tuple[Any, int]:
         "chunk_index": chunk_index,
         "chunk_count": total,
         "chunk": chunks[chunk_index],
+    }), 200
+
+
+@app.route("/oauth/authorize")
+def oauth_authorize() -> tuple[Any, int]:
+    """Step 1: Redirect user to Discord bot install + authorize page.
+
+    How it works for you (operator) and new users:
+    - Visit /oauth/authorize in a browser.
+    - Discord shows the "Add to Server" screen for the bot.
+    - After approving, Discord redirects to DISCORD_OAUTH_REDIRECT_URI (/oauth/callback).
+    - The callback creates a tenant record for the guild, mints an API key, and
+      shows it once. That key is what agents use in tp_key= going forward.
+    """
+    if not TP_OAUTH_ENABLED:
+        oauth_url = _build_oauth_install_url()
+        return jsonify({
+            "error": "oauth_not_enabled",
+            "hint": "Set TP_OAUTH_ENABLED=1 and configure DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET, DISCORD_OAUTH_REDIRECT_URI in .env",
+            "install_url": oauth_url,
+        }), 503
+
+    if not (DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET and DISCORD_OAUTH_REDIRECT_URI):
+        return jsonify({"error": "oauth_not_configured"}), 503
+
+    db = get_db()
+    state = secrets.token_urlsafe(32)
+    db.store_oauth_state(state)
+
+    redirect_url = (
+        f"https://discord.com/oauth2/authorize"
+        f"?client_id={DISCORD_CLIENT_ID}"
+        f"&permissions={DISCORD_BOT_PERMISSIONS}"
+        f"&redirect_uri={DISCORD_OAUTH_REDIRECT_URI}"
+        f"&response_type=code"
+        f"&scope=bot+identify"
+        f"&state={state}"
+    )
+    from flask import redirect as flask_redirect
+    return flask_redirect(redirect_url, 302)
+
+
+@app.route("/oauth/callback")
+def oauth_callback() -> tuple[Any, int]:
+    """Step 2: Discord redirects here after user approves bot install.
+
+    Exchanges the code for a token, reads guild + user identity,
+    creates or retrieves the tenant record, mints a fresh API key,
+    and redirects/returns a show-once token to retrieve it.
+    """
+    if not TP_OAUTH_ENABLED:
+        return jsonify({"error": "oauth_not_enabled"}), 503
+
+    error = request.args.get("error", "").strip()
+    if error:
+        return jsonify({"error": f"discord_oauth_denied: {error}"}), 403
+
+    code = request.args.get("code", "").strip()
+    state = request.args.get("state", "").strip()
+
+    if not code:
+        return jsonify({"error": "missing_oauth_code"}), 400
+
+    # Validate CSRF state
+    if state:
+        db = get_db()
+        if not db.consume_oauth_state(state):
+            return jsonify({"error": "invalid_or_expired_oauth_state"}), 403
+    else:
+        return jsonify({"error": "missing_oauth_state"}), 400
+
+    # Exchange code for access token
+    try:
+        token_resp = requests.post(
+            "https://discord.com/api/v10/oauth2/token",
+            data={
+                "client_id": DISCORD_CLIENT_ID,
+                "client_secret": DISCORD_CLIENT_SECRET,
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": DISCORD_OAUTH_REDIRECT_URI,
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=10,
+        )
+        token_resp.raise_for_status()
+        token_data = token_resp.json()
+    except requests.RequestException as exc:
+        return jsonify({"error": f"discord_token_exchange_failed: {type(exc).__name__}"}), 502
+
+    access_token = token_data.get("access_token", "")
+    guild_data = token_data.get("guild", {})  # present when scope includes bot
+    guild_id = str(guild_data.get("id", "")).strip() if guild_data else ""
+
+    # Fetch installer identity (scope: identify)
+    installer_user = {}
+    if access_token:
+        try:
+            me_resp = requests.get(
+                "https://discord.com/api/v10/users/@me",
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=10,
+            )
+            if me_resp.status_code == 200:
+                installer_user = me_resp.json()
+        except requests.RequestException:
+            pass  # Non-fatal; guild record is what matters
+
+    if not guild_id:
+        return jsonify({
+            "error": "no_guild_in_callback",
+            "hint": "Ensure the OAuth scope includes 'bot' so Discord includes guild data in the callback.",
+        }), 400
+
+    # Create or retrieve tenant, mint API key
+    db = get_db()
+    tenant = db.create_or_get_tenant(guild_id)
+    key_id, raw_key = db.mint_api_key(tenant["tenant_id"])
+
+    # Store show-once token (60s TTL; agent or browser picks it up)
+    show_token = secrets.token_urlsafe(24)
+    now = int(time.time())
+    _SHOW_ONCE[show_token] = {
+        "raw_key": raw_key,
+        "key_id": key_id,
+        "guild_id": guild_id,
+        "installer": installer_user.get("username", "unknown"),
+        "tenant_id": tenant["tenant_id"],
+        "is_new_tenant": tenant["is_new"],
+        "expires_at": now + 60,
+    }
+
+    return jsonify({
+        "status": "authorized",
+        "guild_id": guild_id,
+        "tenant_id": tenant["tenant_id"],
+        "is_new_tenant": tenant["is_new"],
+        "installer": installer_user.get("username", "unknown"),
+        "key_retrieve_url": f"/oauth/key?token={show_token}",
+        "key_retrieve_hint": (
+            "Fetch your API key from key_retrieve_url within 60 seconds. "
+            "It is shown once and never stored in plaintext."
+        ),
+    }), 200
+
+
+@app.route("/oauth/key")
+def oauth_key() -> tuple[Any, int]:
+    """Step 3: Retrieve the raw API key once via the show-once token.
+
+    The raw key is stored in memory for 60 seconds after OAuth callback.
+    After retrieval (or expiry) it is discarded. Store it securely — it
+    cannot be recovered, only revoked and re-issued.
+
+    Usage: GET /oauth/key?token=SHOW_ONCE_TOKEN
+    """
+    token = request.args.get("token", "").strip()
+    if not token:
+        return jsonify({"error": "missing_token"}), 400
+
+    now = int(time.time())
+
+    # Prune expired entries
+    expired = [k for k, v in _SHOW_ONCE.items() if v["expires_at"] <= now]
+    for k in expired:
+        _SHOW_ONCE.pop(k, None)
+
+    entry = _SHOW_ONCE.pop(token, None)
+    if not entry:
+        return jsonify({
+            "error": "show_once_token_invalid_or_expired",
+            "hint": "The key can only be retrieved once within 60s of OAuth. Re-run /oauth/authorize to get a new key.",
+        }), 404
+
+    return jsonify({
+        "api_key": entry["raw_key"],
+        "key_id": entry["key_id"],
+        "tenant_id": entry["tenant_id"],
+        "guild_id": entry["guild_id"],
+        "installer": entry["installer"],
+        "is_new_tenant": entry["is_new_tenant"],
+        "usage_hint": (
+            "Pass this key as ?tp_key=YOUR_KEY on any /messages request. "
+            "Keep it secret. To rotate, re-run /oauth/authorize."
+        ),
+        "example_url": f"/messages?discord_url=https://discord.com/channels/{entry['guild_id']}/CHANNEL_ID&tp_key={entry['raw_key']}",
     }), 200
 
 

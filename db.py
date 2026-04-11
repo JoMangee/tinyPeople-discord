@@ -2,17 +2,21 @@
 
 Provides lightweight multi-tenant isolation:
 - Tenants: Discord guilds that have authenticated via OAuth.
-- API Keys: Per-tenant, per-user issued keys for external access.
+- API Keys: Per-tenant issued keys for external access (raw key never stored).
 - Channel Grants: Per-tenant channel allowlist.
 - Rate Limits: Per-key rolling window counters.
+- OAuth States: Short-lived CSRF state tokens for the OAuth install flow.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
+import secrets
 import sqlite3
 import threading
 import time
+import uuid
 from threading import Lock
 from typing import Any, NamedTuple
 
@@ -134,6 +138,17 @@ class Database:
                 """
             )
 
+            # OAuth States (short-lived CSRF tokens for install flow)
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS oauth_states (
+                    state TEXT PRIMARY KEY,
+                    created_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL
+                )
+                """
+            )
+
             conn.commit()
         except sqlite3.Error as e:
             conn.rollback()
@@ -145,8 +160,34 @@ class Database:
             self._local.conn.close()
             self._local.conn = None
 
+    def get_api_key_by_raw(self, raw_key: str) -> dict[str, Any] | None:
+        """Look up API key by the raw key value (compared via hash).
+        
+        Raw key is never stored; only sha256 hash is kept.
+        """
+        key_hash = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT key_id, tenant_id, created_at, revoked_at
+            FROM api_keys
+            WHERE key_hash = ? AND revoked_at IS NULL
+            """,
+            (key_hash,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return {
+            "key_id": row[0],
+            "tenant_id": row[1],
+            "created_at": row[2],
+            "revoked_at": row[3],
+        }
+
     def get_api_key(self, key_id: str) -> dict[str, Any] | None:
-        """Look up API key by ID (not hash) — for resolved context only."""
+        """Look up API key by internal key_id."""
         conn = self._get_conn()
         cursor = conn.cursor()
         cursor.execute(
@@ -248,6 +289,105 @@ class Database:
             (now, tenant_id, key_id, caller_id, channel_id, action, status, latency_ms),
         )
         conn.commit()
+
+
+    def create_or_get_tenant(self, guild_id: str) -> dict[str, Any]:
+        """Create a tenant record for a guild, or return existing one."""
+        now = int(time.time())
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        # Try to get existing
+        cursor.execute(
+            "SELECT tenant_id, guild_id, created_at FROM tenants WHERE guild_id = ?",
+            (guild_id,),
+        )
+        row = cursor.fetchone()
+        if row:
+            return {"tenant_id": row[0], "guild_id": row[1], "created_at": row[2], "is_new": False}
+        # Create new
+        tenant_id = str(uuid.uuid4())
+        cursor.execute(
+            "INSERT INTO tenants (tenant_id, guild_id, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            (tenant_id, guild_id, now, now),
+        )
+        conn.commit()
+        return {"tenant_id": tenant_id, "guild_id": guild_id, "created_at": now, "is_new": True}
+
+    def mint_api_key(self, tenant_id: str, label: str = "") -> tuple[str, str]:
+        """Create a new API key for a tenant.
+        
+        Returns (key_id, raw_key). The raw_key is only returned here and never
+        stored — only its sha256 hash is persisted. Show it to the user once.
+        """
+        now = int(time.time())
+        raw_key = "tp_" + secrets.token_urlsafe(32)
+        key_id = str(uuid.uuid4())
+        key_hash = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO api_keys (key_id, tenant_id, key_hash, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (key_id, tenant_id, key_hash, now, now),
+        )
+        conn.commit()
+        return key_id, raw_key
+
+    def add_channel_grant(self, tenant_id: str, channel_id: str) -> None:
+        """Add a channel to a tenant's allowlist (idempotent)."""
+        now = int(time.time())
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO channel_grants (tenant_id, channel_id, created_at)
+            VALUES (?, ?, ?)
+            """,
+            (tenant_id, channel_id, now),
+        )
+        conn.commit()
+
+    def get_tenant_by_guild(self, guild_id: str) -> dict[str, Any] | None:
+        """Look up tenant by Discord guild ID."""
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT tenant_id, guild_id, created_at FROM tenants WHERE guild_id = ?",
+            (guild_id,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return {"tenant_id": row[0], "guild_id": row[1], "created_at": row[2]}
+
+    def store_oauth_state(self, state: str, ttl_seconds: int = 300) -> None:
+        """Persist a short-lived OAuth CSRF state token."""
+        now = int(time.time())
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT OR REPLACE INTO oauth_states (state, created_at, expires_at) VALUES (?, ?, ?)",
+            (state, now, now + ttl_seconds),
+        )
+        conn.commit()
+
+    def consume_oauth_state(self, state: str) -> bool:
+        """Validate and delete an OAuth state token. Returns True if valid."""
+        now = int(time.time())
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT state FROM oauth_states WHERE state = ? AND expires_at > ?",
+            (state, now),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return False
+        cursor.execute("DELETE FROM oauth_states WHERE state = ?", (state,))
+        conn.commit()
+        return True
 
 
 # Global instance
