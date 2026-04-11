@@ -173,13 +173,17 @@ function Invoke-SafeCpanelPush {
     git -C $RepoRoot worktree prune | Out-Null
 
     # Clean up leftovers from previous interrupted runs.
-    $existingWorktree = (git -C $RepoRoot worktree list --porcelain) -join "`n"
-    if ($existingWorktree -match [regex]::Escape($worktreePath)) {
-        git -C $RepoRoot worktree remove --force $worktreePath | Out-Null
+    try {
+        git -C $RepoRoot worktree remove --force $worktreePath 2>$null | Out-Null
     }
+    catch {
+        # Best effort cleanup; continue and re-check branch usage below.
+    }
+    $worktreeListRaw = git -C $RepoRoot worktree list --porcelain
+    $worktreeList = (($worktreeListRaw | Out-String).Trim())
     $existingBranchRaw = git -C $RepoRoot branch --list $worktreeBranch
     $existingBranch = (($existingBranchRaw | Out-String).Trim())
-    if ($existingBranch) {
+    if ($existingBranch -and ($worktreeList -notmatch [regex]::Escape("branch refs/heads/$worktreeBranch"))) {
         git -C $RepoRoot branch -D $worktreeBranch | Out-Null
     }
 
@@ -188,7 +192,8 @@ function Invoke-SafeCpanelPush {
         Copy-Item -LiteralPath $deployOverlayFile -Destination (Join-Path $worktreePath ".cpanel.yml") -Force
         git -C $worktreePath add .cpanel.yml
 
-        $pending = (git -C $worktreePath status --porcelain -- .cpanel.yml).Trim()
+        $pendingRaw = git -C $worktreePath status --porcelain -- .cpanel.yml
+        $pending = (($pendingRaw | Out-String).Trim())
         if ($pending) {
             git -C $worktreePath commit -m "cPanel local deploy overlay (non-GitHub)" | Out-Null
         }
