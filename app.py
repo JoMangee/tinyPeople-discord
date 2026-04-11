@@ -31,7 +31,7 @@ except ImportError:
     init_db = None
     AuthContext = None
 
-BOT_VERSION = "0.3.0"
+BOT_VERSION = "0.3.1"
 APP_DIR = os.path.dirname(__file__)
 load_dotenv(os.path.join(APP_DIR, ".env"))
 load_dotenv(os.path.join(APP_DIR, ".deploy-stamp.env"))
@@ -107,6 +107,13 @@ TP_OAUTH_ENABLED = (
     os.getenv("TP_OAUTH_ENABLED", "0").strip().lower()
     in {"1", "true", "yes", "on"}
 )
+try:
+    TP_OAUTH_SHOW_ONCE_TTL_SECONDS = int(
+        os.getenv("TP_OAUTH_SHOW_ONCE_TTL_SECONDS", "300")
+    )
+except ValueError:
+    TP_OAUTH_SHOW_ONCE_TTL_SECONDS = 300
+TP_OAUTH_SHOW_ONCE_TTL_SECONDS = max(60, min(TP_OAUTH_SHOW_ONCE_TTL_SECONDS, 3600))
 
 app = Flask(__name__)
 
@@ -126,6 +133,47 @@ class ApiError(Exception):
     message: str
     status_code: int
     debug: dict[str, Any] | None = None
+
+
+def _error_guidance(error_code: str) -> dict[str, Any] | None:
+    """Return safe, actionable guidance for common client errors."""
+    if error_code == "invalid_digest":
+        return {
+            "hint": (
+                "tp_digest must be the lowercase hex sha256 of "
+                "'{TP_DIGEST_SALT}:{TP_SHARED_SECRET}' (or exactly TP_AGENT_DIGEST when set)."
+            ),
+            "next_step": (
+                "Recompute digest with exact salt/secret bytes (no extra spaces/newlines), "
+                "then retry with ?tp_digest=..."
+            ),
+        }
+    if error_code == "missing_digest":
+        return {
+            "hint": "Provide tp_digest query param (or X-TinyPeople-Digest header).",
+            "next_step": "Add ?tp_digest=YOUR_DIGEST to the request URL.",
+        }
+    if error_code in {"missing_channel_id", "invalid_channel_id"}:
+        return {
+            "hint": "Provide a numeric Discord channel ID or use discord_url.",
+            "next_step": "Example: /messages?channel_id=123... or /messages?discord_url=https://discord.com/channels/GUILD/CHANNEL",
+        }
+    if error_code == "invalid_discord_url":
+        return {
+            "hint": "discord_url must be a Discord channel/message link.",
+            "next_step": "Use: https://discord.com/channels/GUILD_ID/CHANNEL_ID[/MESSAGE_ID]",
+        }
+    if error_code.startswith("limit_out_of_range") or error_code == "invalid_limit":
+        return {
+            "hint": f"limit must be an integer between 1 and {MAX_MESSAGE_LIMIT}.",
+            "next_step": "Retry with a valid limit value.",
+        }
+    if error_code in {"invalid_api_key", "missing_api_key"}:
+        return {
+            "hint": "Provide a valid tenant key as tp_key (or X-TinyPeople-Key).",
+            "next_step": "Run /oauth/authorize to mint a new key, then retry with ?tp_key=...",
+        }
+    return None
 
 
 def _resolve_auth_context() -> tuple[Any, bool]:
@@ -375,8 +423,19 @@ def _authorize_static_digest() -> None:
             f"{TP_DIGEST_SALT}:{TP_SHARED_SECRET}".encode("utf-8")
         ).hexdigest()
 
-    if not hmac.compare_digest(provided.lower(), expected):
-        raise ApiError("invalid_digest", 403)
+    normalized = provided.lower().strip()
+    looks_sha256_hex = bool(re.fullmatch(r"[0-9a-f]{64}", normalized))
+    if not hmac.compare_digest(normalized, expected):
+        raise ApiError(
+            "invalid_digest",
+            403,
+            debug={
+                "provided_length": len(normalized),
+                "looks_sha256_hex": looks_sha256_hex,
+                "digest_recipe": "sha256(f'{TP_DIGEST_SALT}:{TP_SHARED_SECRET}')",
+                "note": "No secret values are returned here.",
+            },
+        )
 
 
 def _authorize_signed_request(channel_id: str, limit: int) -> None:
@@ -771,6 +830,36 @@ def home() -> tuple[Any, int]:
 @app.route("/health")
 def health() -> tuple[Any, int]:
     """Health endpoint with public load stats and auth-gated detail."""
+    oauth_configured = bool(
+        DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET and DISCORD_OAUTH_REDIRECT_URI
+    )
+
+    endpoint_state: dict[str, Any] = {
+        "has_discord_token": bool(DISCORD_TOKEN),
+        "has_shared_secret": bool(TP_SHARED_SECRET),
+        "oauth_enabled": TP_OAUTH_ENABLED,
+        "oauth_configured": oauth_configured,
+        "api_keys_enabled": TP_ENABLE_API_KEYS,
+    }
+
+    if get_db:
+        try:
+            endpoint_state.update(get_db().get_sanitized_system_state())
+        except Exception:
+            endpoint_state["state_counts_unavailable"] = True
+
+    if not endpoint_state["has_discord_token"]:
+        setup_stage = "missing_discord_token"
+    elif not endpoint_state["oauth_enabled"]:
+        setup_stage = "oauth_disabled"
+    elif not endpoint_state["oauth_configured"]:
+        setup_stage = "oauth_not_configured"
+    elif endpoint_state.get("active_api_keys", 0) == 0:
+        setup_stage = "ready_no_keys_issued"
+    else:
+        setup_stage = "ready"
+    endpoint_state["setup_stage"] = setup_stage
+
     payload: dict[str, Any] = {
         "status": "healthy",
         "version": BOT_VERSION,
@@ -778,6 +867,7 @@ def health() -> tuple[Any, int]:
         "build": APP_BUILD,
         "runtime_signature": APP_RUNTIME_SIGNATURE,
         "messages_telemetry": _message_metrics_snapshot(),
+        "endpoint_state": endpoint_state,
     }
 
     # If an API key is supplied, validate it and include tenant + key budget info.
@@ -827,8 +917,7 @@ def health() -> tuple[Any, int]:
         payload.update(
             {
                 "auth_mode": "operator",
-                "has_discord_token": bool(DISCORD_TOKEN),
-                "has_shared_secret": bool(TP_SHARED_SECRET),
+                "operator_auth_valid": True,
             }
         )
 
@@ -943,6 +1032,9 @@ def get_messages() -> tuple[Any, int]:
             )
 
         payload: dict[str, Any] = {"error": exc.message}
+        guidance = _error_guidance(exc.message)
+        if guidance:
+            payload.update(guidance)
 
         # Attach install URL for any bot-permission or auth error so
         # agents and users know exactly what action to take next.
@@ -1001,7 +1093,11 @@ def get_image_chunk() -> tuple[Any, int]:
     try:
         _authorize_request("0", 1)
     except ApiError as exc:
-        return jsonify({"error": exc.message}), exc.status_code
+        payload: dict[str, Any] = {"error": exc.message}
+        guidance = _error_guidance(exc.message)
+        if guidance:
+            payload.update(guidance)
+        return jsonify(payload), exc.status_code
 
     url = request.args.get("url", "").strip()
     if not url:
@@ -1170,7 +1266,7 @@ def oauth_callback() -> tuple[Any, int]:
     tenant = db.create_or_get_tenant(guild_id)
     key_id, raw_key = db.mint_api_key(tenant["tenant_id"])
 
-    # Store show-once token (60s TTL; agent or browser picks it up)
+    # Store show-once token (configurable TTL; agent or browser picks it up)
     show_token = secrets.token_urlsafe(24)
     now = int(time.time())
     _SHOW_ONCE[show_token] = {
@@ -1180,7 +1276,7 @@ def oauth_callback() -> tuple[Any, int]:
         "installer": installer_user.get("username", "unknown"),
         "tenant_id": tenant["tenant_id"],
         "is_new_tenant": tenant["is_new"],
-        "expires_at": now + 60,
+        "expires_at": now + TP_OAUTH_SHOW_ONCE_TTL_SECONDS,
     }
 
     return jsonify({
@@ -1191,7 +1287,7 @@ def oauth_callback() -> tuple[Any, int]:
         "installer": installer_user.get("username", "unknown"),
         "key_retrieve_url": f"/oauth/key?token={show_token}",
         "key_retrieve_hint": (
-            "Fetch your API key from key_retrieve_url within 60 seconds. "
+            f"Fetch your API key from key_retrieve_url within {TP_OAUTH_SHOW_ONCE_TTL_SECONDS} seconds. "
             "It is shown once and never stored in plaintext."
         ),
     }), 200
@@ -1201,7 +1297,7 @@ def oauth_callback() -> tuple[Any, int]:
 def oauth_key() -> tuple[Any, int]:
     """Step 3: Retrieve the raw API key once via the show-once token.
 
-    The raw key is stored in memory for 60 seconds after OAuth callback.
+    The raw key is stored in memory for a short configurable TTL after OAuth callback.
     After retrieval (or expiry) it is discarded. Store it securely — it
     cannot be recovered, only revoked and re-issued.
 
@@ -1222,7 +1318,7 @@ def oauth_key() -> tuple[Any, int]:
     if not entry:
         return jsonify({
             "error": "show_once_token_invalid_or_expired",
-            "hint": "The key can only be retrieved once within 60s of OAuth. Re-run /oauth/authorize to get a new key.",
+            "hint": f"The key can only be retrieved once within {TP_OAUTH_SHOW_ONCE_TTL_SECONDS}s of OAuth. Re-run /oauth/authorize to get a new key.",
         }), 404
 
     return jsonify({

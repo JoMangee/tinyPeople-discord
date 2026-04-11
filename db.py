@@ -20,7 +20,7 @@ import uuid
 from threading import Lock
 from typing import Any, NamedTuple
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 
 class AuthContext(NamedTuple):
@@ -491,6 +491,31 @@ class Database:
         cursor.execute("DELETE FROM oauth_states WHERE state = ?", (state,))
         conn.commit()
         return True
+
+    def get_sanitized_system_state(self) -> dict[str, int]:
+        """Return aggregate, non-identifying counts for health reporting."""
+        now = int(time.time())
+        conn = self._get_conn()
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT COUNT(*) FROM tenants")
+        tenants_count = int(cursor.fetchone()[0])
+
+        cursor.execute("SELECT COUNT(*) FROM api_keys WHERE revoked_at IS NULL")
+        active_api_keys_count = int(cursor.fetchone()[0])
+
+        cursor.execute("SELECT COUNT(*) FROM channel_grants")
+        channel_grants_count = int(cursor.fetchone()[0])
+
+        cursor.execute("SELECT COUNT(*) FROM oauth_states WHERE expires_at > ?", (now,))
+        pending_oauth_states_count = int(cursor.fetchone()[0])
+
+        return {
+            "authorized_tenants": tenants_count,
+            "active_api_keys": active_api_keys_count,
+            "channel_grants": channel_grants_count,
+            "pending_oauth_states": pending_oauth_states_count,
+        }
 
 
 # Global instance

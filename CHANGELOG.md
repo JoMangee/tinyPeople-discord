@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.1 — 2026-04-11
+
+### Changed
+- BOT_VERSION bumped to 0.3.1
+- OAuth show-once key retrieval TTL is now configurable via TP_OAUTH_SHOW_ONCE_TTL_SECONDS (default 300s)
+- Added more actionable error guidance for auth/parameter issues (including invalid_digest hints)
+- /health now includes sanitized endpoint_state setup signals (token/config booleans + aggregate tenant/key counts)
+
+---
+
 ## 0.3.0 — 2026-04-11
 
 ### Added
