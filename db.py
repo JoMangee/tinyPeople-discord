@@ -458,6 +458,42 @@ class Database:
         )
         conn.commit()
 
+    def list_channel_grants_for_tenant(self, tenant_id: str) -> list[dict[str, Any]]:
+        """List channel allowlist entries for a tenant."""
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT channel_id, created_at
+            FROM channel_grants
+            WHERE tenant_id = ?
+            ORDER BY created_at DESC
+            """,
+            (tenant_id,),
+        )
+        rows = cursor.fetchall()
+        return [
+            {
+                "channel_id": row[0],
+                "created_at": row[1],
+            }
+            for row in rows
+        ]
+
+    def remove_channel_grant(self, tenant_id: str, channel_id: str) -> bool:
+        """Remove a channel from tenant allowlist. Returns True if removed."""
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            DELETE FROM channel_grants
+            WHERE tenant_id = ? AND channel_id = ?
+            """,
+            (tenant_id, channel_id),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
     def get_tenant_by_guild(self, guild_id: str) -> dict[str, Any] | None:
         """Look up tenant by Discord guild ID."""
         conn = self._get_conn()
