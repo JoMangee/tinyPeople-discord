@@ -158,9 +158,20 @@ function Invoke-SafeCpanelPush {
         [string]$RemoteRef = "master"
     )
 
-    $meshnetDeployFile = Join-Path $RepoRoot ".cpanel.yml.meshnet"
-    if (-not (Test-Path -LiteralPath $meshnetDeployFile)) {
-        Write-Host "Local deploy override not found at .cpanel.yml.meshnet; pushing current branch directly."
+    $localDeployFile = Join-Path $RepoRoot ".cpanel.yml.local"
+    $legacyDeployFile = Join-Path $RepoRoot ".cpanel.yml.meshnet"
+    $deployOverlayFile = $null
+
+    if (Test-Path -LiteralPath $localDeployFile) {
+        $deployOverlayFile = $localDeployFile
+    }
+    elseif (Test-Path -LiteralPath $legacyDeployFile) {
+        $deployOverlayFile = $legacyDeployFile
+        Write-Host "Found legacy .cpanel.yml.meshnet; prefer renaming it to .cpanel.yml.local."
+    }
+
+    if (-not $deployOverlayFile) {
+        Write-Host "Local deploy override not found at .cpanel.yml.local (or legacy .cpanel.yml.meshnet); pushing current branch directly."
         git -C $RepoRoot push $RemoteName $RemoteRef
         return
     }
@@ -168,7 +179,7 @@ function Invoke-SafeCpanelPush {
     $worktreePath = Join-Path $RepoRoot ".git\cpanel-deploy-worktree"
     $worktreeBranch = "cpanel-deploy-local"
 
-    Write-Host "Using temporary worktree deploy branch with local .cpanel.yml.meshnet overlay."
+    Write-Host "Using temporary worktree deploy branch with local .cpanel.yml.local overlay."
     git -C $RepoRoot worktree prune | Out-Null
 
     # Clean up leftovers from previous interrupted runs.
@@ -183,7 +194,7 @@ function Invoke-SafeCpanelPush {
 
     git -C $RepoRoot worktree add -B $worktreeBranch $worktreePath HEAD | Out-Null
     try {
-        Copy-Item -LiteralPath $meshnetDeployFile -Destination (Join-Path $worktreePath ".cpanel.yml") -Force
+        Copy-Item -LiteralPath $deployOverlayFile -Destination (Join-Path $worktreePath ".cpanel.yml") -Force
         git -C $worktreePath add .cpanel.yml
 
         $pending = (git -C $worktreePath status --porcelain -- .cpanel.yml).Trim()
@@ -209,6 +220,7 @@ if ($Push) {
     Write-Host "A GUI passphrase dialog will appear when git connects. Run:"
     Write-Host "  .\ops\scripts\Use-TinyPeopleRepoEnv.ps1 -Push"
     Write-Host ""
-    Write-Host "-Push uses a temporary local worktree branch and overlays .cpanel.yml.meshnet"
+    Write-Host "-Push uses a temporary local worktree branch and overlays .cpanel.yml.local"
+    Write-Host "(legacy fallback: .cpanel.yml.meshnet)"
     Write-Host "only for the cPanel push, so tracked master stays GitHub-safe."
 }
