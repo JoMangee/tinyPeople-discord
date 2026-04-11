@@ -1182,5 +1182,101 @@ def oauth_key() -> tuple[Any, int]:
     }), 200
 
 
+@app.route("/terms")
+def terms() -> tuple[Any, int]:
+    """Terms of Service — required by Discord for public OAuth applications."""
+    TP_SERVICE_NAME = os.getenv("TP_SERVICE_NAME", "tinyPeople Discord Messages API")
+    TP_CONTACT_EMAIL = os.getenv("TP_CONTACT_EMAIL", "")
+    TP_BASE_URL = os.getenv("TP_BASE_URL", "https://your-domain")
+    from flask import Response
+    body = f"""<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Terms of Service — {TP_SERVICE_NAME}</title>
+<style>body{{font-family:sans-serif;max-width:720px;margin:2rem auto;padding:0 1rem;line-height:1.6}}
+h1{{font-size:1.5rem}}h2{{font-size:1.1rem;margin-top:2rem}}a{{color:#5865F2}}</style>
+</head>
+<body>
+<h1>Terms of Service</h1>
+<p><strong>{TP_SERVICE_NAME}</strong></p>
+<p>Last updated: April 2026</p>
+
+<h2>1. Service Description</h2>
+<p>This service provides an API that reads messages from Discord channels your bot account
+has been authorised to access. It does not send messages, modify servers, or store message content.</p>
+
+<h2>2. Authorisation</h2>
+<p>By installing this bot to your Discord server via the OAuth flow, you authorise it to read
+messages in channels it has been granted access to. You can remove the bot from your server at
+any time via Discord server settings.</p>
+
+<h2>3. API Keys</h2>
+<p>Each API key is scoped to the guild that authorised it. Keys are stored as one-way hashes;
+the raw key is shown once at creation and cannot be recovered. Keep your key secret.
+Do not share keys across users. Re-issue via <a href="{TP_BASE_URL}/oauth/authorize">/oauth/authorize</a> if compromised.</p>
+
+<h2>4. Rate Limits</h2>
+<p>Requests are rate-limited per API key to protect both the Discord API and other users of
+this service. Repeated limit violations may result in key suspension.</p>
+
+<h2>5. No Warranty</h2>
+<p>This service is provided as-is. No guarantee of uptime, accuracy, or fitness for a particular
+purpose is made.</p>
+
+<h2>6. Changes</h2>
+<p>These terms may be updated. Continued use after changes constitutes acceptance.</p>
+
+{"<h2>7. Contact</h2><p>Questions: <a href='mailto:" + TP_CONTACT_EMAIL + "'>" + TP_CONTACT_EMAIL + "</a></p>" if TP_CONTACT_EMAIL else ""}
+</body>
+</html>"""
+    return Response(body, mimetype="text/html"), 200
+
+
+@app.route("/privacy")
+def privacy() -> tuple[Any, int]:
+    """Privacy Policy — required by Discord for public OAuth applications."""
+    TP_SERVICE_NAME = os.getenv("TP_SERVICE_NAME", "tinyPeople Discord Messages API")
+    TP_CONTACT_EMAIL = os.getenv("TP_CONTACT_EMAIL", "")
+    from flask import Response
+    body = f"""<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Privacy Policy — {TP_SERVICE_NAME}</title>
+<style>body{{font-family:sans-serif;max-width:720px;margin:2rem auto;padding:0 1rem;line-height:1.6}}
+h1{{font-size:1.5rem}}h2{{font-size:1.1rem;margin-top:2rem}}</style>
+</head>
+<body>
+<h1>Privacy Policy</h1>
+<p><strong>{TP_SERVICE_NAME}</strong></p>
+<p>Last updated: April 2026</p>
+
+<h2>What we collect</h2>
+<ul>
+  <li><strong>Guild ID</strong>: stored to associate your server with your API key.</li>
+  <li><strong>Installer username</strong>: stored once at OAuth time for audit purposes.</li>
+  <li><strong>Request metadata</strong>: timestamp, channel ID, HTTP status, latency — stored
+      in an audit log. No message content is stored.</li>
+  <li><strong>API key hash</strong>: SHA-256 hash of your key. The raw key is never stored.</li>
+</ul>
+
+<h2>What we do not collect</h2>
+<ul>
+  <li>We do not store Discord message content.</li>
+  <li>We do not store user IDs of people who send messages (only the requesting agent/key).</li>
+  <li>We do not sell or share data with third parties.</li>
+</ul>
+
+<h2>Discord API</h2>
+<p>Message data is fetched live from Discord's API using a bot token on your behalf.
+Discord's own <a href="https://discord.com/privacy">Privacy Policy</a> applies to that data.</p>
+
+<h2>Data retention</h2>
+<p>Audit log entries and tenant records persist until manually purged by the operator.
+You can request deletion by revoking your bot from your server and contacting the operator.</p>
+
+{"<h2>Contact</h2><p>" + TP_CONTACT_EMAIL + "</p>" if TP_CONTACT_EMAIL else ""}
+</body>
+</html>"""
+    return Response(body, mimetype="text/html"), 200
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")), debug=False)
