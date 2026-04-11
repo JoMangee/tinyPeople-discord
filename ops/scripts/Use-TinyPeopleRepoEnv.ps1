@@ -177,7 +177,8 @@ function Invoke-SafeCpanelPush {
     if ($existingWorktree -match [regex]::Escape($worktreePath)) {
         git -C $RepoRoot worktree remove --force $worktreePath | Out-Null
     }
-    $existingBranch = (git -C $RepoRoot branch --list $worktreeBranch).Trim()
+    $existingBranchRaw = git -C $RepoRoot branch --list $worktreeBranch
+    $existingBranch = (($existingBranchRaw | Out-String).Trim())
     if ($existingBranch) {
         git -C $RepoRoot branch -D $worktreeBranch | Out-Null
     }
@@ -197,7 +198,8 @@ function Invoke-SafeCpanelPush {
     }
     finally {
         git -C $RepoRoot worktree remove --force $worktreePath | Out-Null
-        $branchStillExists = (git -C $RepoRoot branch --list $worktreeBranch).Trim()
+        $branchStillExistsRaw = git -C $RepoRoot branch --list $worktreeBranch
+        $branchStillExists = (($branchStillExistsRaw | Out-String).Trim())
         if ($branchStillExists) {
             git -C $RepoRoot branch -D $worktreeBranch | Out-Null
         }
