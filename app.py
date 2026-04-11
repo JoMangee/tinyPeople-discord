@@ -31,7 +31,7 @@ except ImportError:
     init_db = None
     AuthContext = None
 
-BOT_VERSION = "0.3.1"
+BOT_VERSION = "0.3.2"
 APP_DIR = os.path.dirname(__file__)
 load_dotenv(os.path.join(APP_DIR, ".env"))
 load_dotenv(os.path.join(APP_DIR, ".deploy-stamp.env"))
@@ -118,8 +118,11 @@ TP_OAUTH_SHOW_ONCE_TTL_SECONDS = max(60, min(TP_OAUTH_SHOW_ONCE_TTL_SECONDS, 360
 app = Flask(__name__)
 
 # Show-once token store: raw key is held here briefly after OAuth then discarded.
-# Maps one-time token -> {raw_key, guild_id, expires_at}
+# Maps one-time token -> {raw_key, guild_id, expires_at, pairing_id}
 _SHOW_ONCE: dict[str, dict] = {}
+# Pairing index for agent-driven Magic Link flow.
+# Maps pairing_id -> show_token so /oauth/claim can look up by pairing_id.
+_PAIRING_INDEX: dict[str, str] = {}
 RECENT_NONCES: dict[str, int] = {}
 MESSAGE_REQUEST_TIMESTAMPS: deque[int] = deque()
 MESSAGE_HOST_SEEN_AT: dict[str, int] = {}
@@ -1160,6 +1163,12 @@ def oauth_authorize() -> tuple[Any, int]:
     - After approving, Discord redirects to DISCORD_OAUTH_REDIRECT_URI (/oauth/callback).
     - The callback creates a tenant record for the guild, mints an API key, and
       shows it once. That key is what agents use in tp_key= going forward.
+
+    Agent-driven pairing flow (Magic Link):
+    - Agent supplies ?pairing_id=RANDOM_TOKEN to get back JSON with an authorize_url
+      to hand to the user rather than a redirect.
+    - After the user authorizes, the agent calls /oauth/claim?pairing_id=...&tp_digest=...
+      to collect the key without the user needing to copy anything.
     """
     if not TP_OAUTH_ENABLED:
         oauth_url = _build_oauth_install_url()
@@ -1172,9 +1181,21 @@ def oauth_authorize() -> tuple[Any, int]:
     if not (DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET and DISCORD_OAUTH_REDIRECT_URI):
         return jsonify({"error": "oauth_not_configured"}), 503
 
+    # Optional agent-driven pairing: caller provides a stable pairing_id they will
+    # use later to claim the key via /oauth/claim (no copy-paste needed).
+    pairing_id = request.args.get("pairing_id", "").strip() or None
+    if pairing_id and (
+        len(pairing_id) > 128
+        or not re.fullmatch(r"[A-Za-z0-9_\-]+", pairing_id)
+    ):
+        return jsonify({
+            "error": "invalid_pairing_id",
+            "hint": "pairing_id must be URL-safe alphanumeric, dash, or underscore — max 128 chars.",
+        }), 400
+
     db = get_db()
     state = secrets.token_urlsafe(32)
-    db.store_oauth_state(state)
+    db.store_oauth_state(state, pairing_id=pairing_id)
 
     redirect_url = (
         f"https://discord.com/oauth2/authorize"
@@ -1185,6 +1206,21 @@ def oauth_authorize() -> tuple[Any, int]:
         f"&scope=bot+identify"
         f"&state={state}"
     )
+
+    if pairing_id:
+        # Agent-driven pairing: return JSON so the agent can hand the URL to the user.
+        return jsonify({
+            "status": "pairing_initiated",
+            "pairing_id": pairing_id,
+            "authorize_url": redirect_url,
+            "claim_url": f"{TP_BASE_URL}/oauth/claim?pairing_id={pairing_id}",
+            "hint": (
+                f"Have the user open authorize_url and approve the bot. "
+                f"Then call claim_url with ?tp_digest=YOUR_DIGEST to retrieve the key. "
+                f"The claim window is {TP_OAUTH_SHOW_ONCE_TTL_SECONDS}s after the user authorizes."
+            ),
+        }), 200
+
     from flask import redirect as flask_redirect
     return flask_redirect(redirect_url, 302)
 
@@ -1213,7 +1249,8 @@ def oauth_callback() -> tuple[Any, int]:
     # Validate CSRF state
     if state:
         db = get_db()
-        if not db.consume_oauth_state(state):
+        valid, pairing_id = db.consume_oauth_state(state)
+        if not valid:
             return jsonify({"error": "invalid_or_expired_oauth_state"}), 403
     else:
         return jsonify({"error": "missing_oauth_state"}), 400
@@ -1276,8 +1313,11 @@ def oauth_callback() -> tuple[Any, int]:
         "installer": installer_user.get("username", "unknown"),
         "tenant_id": tenant["tenant_id"],
         "is_new_tenant": tenant["is_new"],
+        "pairing_id": pairing_id,
         "expires_at": now + TP_OAUTH_SHOW_ONCE_TTL_SECONDS,
     }
+    if pairing_id:
+        _PAIRING_INDEX[pairing_id] = show_token
 
     return jsonify({
         "status": "authorized",
@@ -1312,7 +1352,9 @@ def oauth_key() -> tuple[Any, int]:
     # Prune expired entries
     expired = [k for k, v in _SHOW_ONCE.items() if v["expires_at"] <= now]
     for k in expired:
-        _SHOW_ONCE.pop(k, None)
+        expired_entry = _SHOW_ONCE.pop(k, None)
+        if expired_entry and expired_entry.get("pairing_id"):
+            _PAIRING_INDEX.pop(expired_entry["pairing_id"], None)
 
     entry = _SHOW_ONCE.pop(token, None)
     if not entry:
@@ -1331,6 +1373,79 @@ def oauth_key() -> tuple[Any, int]:
         "usage_hint": (
             "Pass this key as ?tp_key=YOUR_KEY on any /messages request. "
             "Keep it secret. To rotate, re-run /oauth/authorize."
+        ),
+        "example_url": f"/messages?discord_url=https://discord.com/channels/{entry['guild_id']}/CHANNEL_ID&tp_key={entry['raw_key']}",
+    }), 200
+
+
+@app.route("/oauth/claim")
+def oauth_claim() -> tuple[Any, int]:
+    """Claim an API key by pairing_id after the user has completed OAuth.
+
+    Part of the agent-driven Magic Link flow:
+    1. Agent calls GET /oauth/authorize?pairing_id=RANDOM -> gets authorize_url.
+    2. Agent shows the URL to the user; user clicks and authorizes the bot.
+    3. Agent calls GET /oauth/claim?pairing_id=RANDOM&tp_digest=DIGEST -> gets the key.
+
+    Requires operator digest auth. One-time retrieval — expires at the same
+    TTL as the show-once token (TP_OAUTH_SHOW_ONCE_TTL_SECONDS after authorization).
+
+    Returns 202 if the user has not yet authorized (safe to poll).
+    Returns 200 with the key on first successful claim.
+    Returns 410 if already claimed.
+    """
+    if not TP_OAUTH_ENABLED:
+        return jsonify({"error": "oauth_not_enabled"}), 503
+
+    try:
+        _authorize_static_digest()
+    except ApiError as exc:
+        return jsonify({"error": exc.message, **(_error_guidance(exc.message) or {})}), exc.status_code
+
+    pairing_id = request.args.get("pairing_id", "").strip()
+    if not pairing_id:
+        return jsonify({"error": "missing_pairing_id"}), 400
+
+    now = int(time.time())
+    # Prune expired show-once entries and their pairing index entries
+    expired = [k for k, v in _SHOW_ONCE.items() if v["expires_at"] <= now]
+    for k in expired:
+        expired_entry = _SHOW_ONCE.pop(k, None)
+        if expired_entry and expired_entry.get("pairing_id"):
+            _PAIRING_INDEX.pop(expired_entry["pairing_id"], None)
+
+    show_token = _PAIRING_INDEX.get(pairing_id)
+    if not show_token:
+        # 202: user may not have authorized yet — safe for the agent to poll
+        return jsonify({
+            "status": "pending_or_expired",
+            "error": "pairing_not_ready",
+            "hint": "The user has not yet completed authorization, or the claim window has expired.",
+            "next_step": (
+                f"If the user has not authorized yet, wait and retry. "
+                f"Claims expire {TP_OAUTH_SHOW_ONCE_TTL_SECONDS}s after authorization. "
+                "To restart, call /oauth/authorize?pairing_id=NEW_ID with a fresh pairing_id."
+            ),
+        }), 202
+
+    _PAIRING_INDEX.pop(pairing_id, None)
+    entry = _SHOW_ONCE.pop(show_token, None)
+    if not entry:
+        return jsonify({
+            "error": "pairing_already_claimed",
+            "hint": "This pairing was already claimed or expired.",
+        }), 410
+
+    return jsonify({
+        "api_key": entry["raw_key"],
+        "key_id": entry["key_id"],
+        "tenant_id": entry["tenant_id"],
+        "guild_id": entry["guild_id"],
+        "installer": entry["installer"],
+        "is_new_tenant": entry["is_new_tenant"],
+        "usage_hint": (
+            "Pass this key as ?tp_key=YOUR_KEY on any /messages request. "
+            "Keep it secret. To rotate, call /oauth/authorize with a new pairing_id."
         ),
         "example_url": f"/messages?discord_url=https://discord.com/channels/{entry['guild_id']}/CHANNEL_ID&tp_key={entry['raw_key']}",
     }), 200

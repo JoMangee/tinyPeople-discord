@@ -20,7 +20,7 @@ import uuid
 from threading import Lock
 from typing import Any, NamedTuple
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 
 
 class AuthContext(NamedTuple):
@@ -146,10 +146,16 @@ class Database:
                 CREATE TABLE IF NOT EXISTS oauth_states (
                     state TEXT PRIMARY KEY,
                     created_at INTEGER NOT NULL,
-                    expires_at INTEGER NOT NULL
+                    expires_at INTEGER NOT NULL,
+                    pairing_id TEXT
                 )
                 """
             )
+            # Migration: add pairing_id column to existing DBs that lack it
+            try:
+                cursor.execute("ALTER TABLE oauth_states ADD COLUMN pairing_id TEXT")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
 
             conn.commit()
         except sqlite3.Error as e:
@@ -465,32 +471,35 @@ class Database:
             return None
         return {"tenant_id": row[0], "guild_id": row[1], "created_at": row[2]}
 
-    def store_oauth_state(self, state: str, ttl_seconds: int = 300) -> None:
+    def store_oauth_state(
+        self, state: str, ttl_seconds: int = 300, pairing_id: str | None = None
+    ) -> None:
         """Persist a short-lived OAuth CSRF state token."""
         now = int(time.time())
         conn = self._get_conn()
         cursor = conn.cursor()
         cursor.execute(
-            "INSERT OR REPLACE INTO oauth_states (state, created_at, expires_at) VALUES (?, ?, ?)",
-            (state, now, now + ttl_seconds),
+            "INSERT OR REPLACE INTO oauth_states (state, created_at, expires_at, pairing_id) VALUES (?, ?, ?, ?)",
+            (state, now, now + ttl_seconds, pairing_id),
         )
         conn.commit()
 
-    def consume_oauth_state(self, state: str) -> bool:
-        """Validate and delete an OAuth state token. Returns True if valid."""
+    def consume_oauth_state(self, state: str) -> tuple[bool, str | None]:
+        """Validate and delete an OAuth state token. Returns (valid, pairing_id)."""
         now = int(time.time())
         conn = self._get_conn()
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT state FROM oauth_states WHERE state = ? AND expires_at > ?",
+            "SELECT state, pairing_id FROM oauth_states WHERE state = ? AND expires_at > ?",
             (state, now),
         )
         row = cursor.fetchone()
         if not row:
-            return False
+            return False, None
+        pairing_id = row[1] if len(row) > 1 else None
         cursor.execute("DELETE FROM oauth_states WHERE state = ?", (state,))
         conn.commit()
-        return True
+        return True, pairing_id
 
     def get_sanitized_system_state(self) -> dict[str, int]:
         """Return aggregate, non-identifying counts for health reporting."""
