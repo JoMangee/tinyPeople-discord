@@ -21,11 +21,25 @@ import requests
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 
-BOT_VERSION = "0.1.1"
+try:
+    from db import get_db, init_db, AuthContext
+except ImportError:
+    # db module optional; can run without multi-tenant features
+    get_db = None
+    init_db = None
+    AuthContext = None
+
+BOT_VERSION = "0.2.0"
 APP_DIR = os.path.dirname(__file__)
 load_dotenv(os.path.join(APP_DIR, ".env"))
 load_dotenv(os.path.join(APP_DIR, ".deploy-stamp.env"))
-
+# Initialize database for multi-tenant features (optional)
+if init_db:
+    TP_DB_PATH = os.getenv("TP_DB_PATH", "var/tinypeople.db")
+    if not os.path.isabs(TP_DB_PATH):
+        TP_DB_PATH = os.path.join(APP_DIR, TP_DB_PATH)
+    os.makedirs(os.path.dirname(TP_DB_PATH), exist_ok=True)
+    init_db(TP_DB_PATH)
 APP_REVISION = os.getenv("POD_APP_REVISION", "dev")
 APP_BUILD = os.getenv("POD_APP_BUILD", "local")
 APP_RUNTIME_SIGNATURE = f"v{BOT_VERSION} | rev {APP_REVISION} | build {APP_BUILD}"
@@ -73,6 +87,14 @@ ALLOWED_CHANNEL_IDS = {
     if channel_id.strip()
 }
 
+# Multi-tenant rate limiting and API keys (Phase 1)
+TP_RATE_LIMIT_PER_MINUTE = int(os.getenv("TP_RATE_LIMIT_PER_MINUTE", "30"))
+TP_RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("TP_RATE_LIMIT_WINDOW_SECONDS", "60"))
+TP_ENABLE_API_KEYS = (
+    os.getenv("TP_ENABLE_API_KEYS", "0").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+
 app = Flask(__name__)
 RECENT_NONCES: dict[str, int] = {}
 MESSAGE_REQUEST_TIMESTAMPS: deque[int] = deque()
@@ -87,6 +109,38 @@ class ApiError(Exception):
     message: str
     status_code: int
     debug: dict[str, Any] | None = None
+
+
+def _resolve_auth_context() -> tuple[Any, bool]:
+    """Resolve caller context from request auth material.
+    
+    Returns (AuthContext or None, is_key_based).
+    If using API keys, returns (context, True) and may raise ApiError.
+    Otherwise returns (None, False) to fall through to legacy auth.
+    """
+    if not (get_db and TP_ENABLE_API_KEYS):
+        return None, False
+
+    api_key = (
+        request.headers.get("X-TinyPeople-Key", "").strip()
+        or request.args.get("tp_key", "").strip()
+    )
+    if not api_key:
+        return None, False
+
+    # API key provided; validate it
+    db = get_db()
+    key_info = db.get_api_key(api_key)
+    if not key_info:
+        raise ApiError("invalid_api_key", 403)
+    
+    context = AuthContext(
+        caller_id=api_key,
+        tenant_id=key_info["tenant_id"],
+        key_id=api_key,
+        auth_mode="api_key",
+    )
+    return context, True
 
 
 def _debug_requested() -> bool:
@@ -675,14 +729,44 @@ def health() -> tuple[Any, int]:
 @app.route("/messages", methods=["GET"])
 def get_messages() -> tuple[Any, int]:
     """Return latest messages for a Discord channel by channel ID."""
+    start_time = time.time()
     debug_enabled = _debug_requested()
     raw_image_mode = _raw_image_mode_requested()
     _record_message_request()
+    
+    auth_context = None
+    channel_id = None
+    
     try:
+        # Try to resolve API key / tenant auth context (new)
+        auth_context, is_key_based = _resolve_auth_context()
+        
+        # Parse and validate parameters
         channel_id = _validate_channel_id(request.args.get("channel_id"))
         message_id = _validate_message_id(request.args.get("message_id"))
         limit = _parse_limit(request.args.get("limit"))
-        _authorize_request(channel_id, limit)
+        
+        # If no API key, fall through to legacy shared-secret auth
+        if not is_key_based:
+            _authorize_request(channel_id, limit)
+        
+        # Check tenant-scoped channel access if applicable
+        if auth_context and auth_context.tenant_id and get_db:
+            db = get_db()
+            if not db.is_channel_allowed_for_tenant(auth_context.tenant_id, channel_id):
+                raise ApiError("channel_not_allowed_for_tenant", 403)
+        
+        # Check rate limit if using API key
+        if auth_context and auth_context.key_id and get_db:
+            db = get_db()
+            if not db.check_and_record_rate_limit(
+                auth_context.key_id,
+                max_requests=TP_RATE_LIMIT_PER_MINUTE,
+                window_seconds=TP_RATE_LIMIT_WINDOW_SECONDS,
+            ):
+                raise ApiError("rate_limit_exceeded", 429)
+        
+        # Fetch messages
         if message_id:
             messages = [
                 _fetch_discord_message_by_id(
@@ -693,7 +777,36 @@ def get_messages() -> tuple[Any, int]:
             messages = _fetch_discord_messages(
                 channel_id, limit, include_raw_images=raw_image_mode
             )
+        
+        # Log successful request (audit)
+        if auth_context and get_db:
+            latency_ms = int((time.time() - start_time) * 1000)
+            db = get_db()
+            db.audit_log(
+                caller_id=auth_context.caller_id,
+                action="fetch_messages",
+                status=200,
+                latency_ms=latency_ms,
+                tenant_id=auth_context.tenant_id,
+                key_id=auth_context.key_id,
+                channel_id=channel_id,
+            )
+        
     except ApiError as exc:
+        # Log error (audit)
+        if auth_context and get_db:
+            latency_ms = int((time.time() - start_time) * 1000)
+            db = get_db()
+            db.audit_log(
+                caller_id=auth_context.caller_id,
+                action="fetch_messages",
+                status=exc.status_code,
+                latency_ms=latency_ms,
+                tenant_id=auth_context.tenant_id,
+                key_id=auth_context.key_id,
+                channel_id=channel_id or request.args.get("channel_id", ""),
+            )
+        
         payload: dict[str, Any] = {"error": exc.message}
         if debug_enabled:
             payload["debug"] = {
