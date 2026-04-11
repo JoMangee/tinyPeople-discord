@@ -170,5 +170,7 @@ python app.py
 ## Deployment Notes
 
 - Passenger entrypoint: passenger_wsgi.py
+- `.cpanel.yml` is an example template with placeholders (`USERNAME`, `APPDOMAIN`).
+- Keep your real host-specific deployment file in a local gitignored override (for example `.cpanel.yml.USERNAME`).
 - Keep host-specific secrets and SSH details in local gitignored files only.
 - Use ops/scripts/Use-TinyPeopleRepoEnv.ps1 for repository-local SSH environment setup.
