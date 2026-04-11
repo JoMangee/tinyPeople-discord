@@ -193,8 +193,8 @@ function Invoke-SafeCpanelPush {
             git -C $worktreePath commit -m "cPanel local deploy overlay (non-GitHub)" | Out-Null
         }
 
-        Write-Host "Running: git push $RemoteName HEAD:$RemoteRef"
-        git -C $worktreePath push $RemoteName HEAD:$RemoteRef
+        Write-Host "Running: git push --force-with-lease $RemoteName HEAD:$RemoteRef"
+        git -C $worktreePath push --force-with-lease $RemoteName HEAD:$RemoteRef
     }
     finally {
         git -C $RepoRoot worktree remove --force $worktreePath | Out-Null
