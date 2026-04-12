@@ -21,7 +21,13 @@ from typing import Any
 
 import requests
 from dotenv import load_dotenv
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request
+try:
+    from nacl.exceptions import BadSignatureError
+    from nacl.signing import VerifyKey
+except ImportError:
+    BadSignatureError = Exception
+    VerifyKey = None
 
 try:
     from db import get_db, init_db, AuthContext
@@ -108,12 +114,18 @@ TP_ENABLE_API_KEYS = (
 DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID", "").strip()
 DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "").strip()
 DISCORD_OAUTH_REDIRECT_URI = os.getenv("DISCORD_OAUTH_REDIRECT_URI", "").strip()
+DISCORD_APP_PUBLIC_KEY = os.getenv("DISCORD_APP_PUBLIC_KEY", "").strip().lower()
+DISCORD_INTERACTIONS_ENABLED = (
+    os.getenv("DISCORD_INTERACTIONS_ENABLED", "1").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
 # View Channel (1024) + Read Message History (65536)
 DISCORD_BOT_PERMISSIONS = os.getenv("DISCORD_BOT_PERMISSIONS", "66560").strip()
 TP_OAUTH_ENABLED = (
     os.getenv("TP_OAUTH_ENABLED", "0").strip().lower()
     in {"1", "true", "yes", "on"}
 )
+TP_BASE_URL = os.getenv("TP_BASE_URL", "").strip()
 try:
     TP_OAUTH_SHOW_ONCE_TTL_SECONDS = int(
         os.getenv("TP_OAUTH_SHOW_ONCE_TTL_SECONDS", "300")
@@ -827,6 +839,7 @@ def _fetch_discord_messages(
 @app.route("/")
 def home() -> tuple[Any, int]:
     """Operator-facing status endpoint."""
+    help_url = f"{request.url_root.rstrip('/')}/help"
     return (
         jsonify(
             {
@@ -836,10 +849,164 @@ def home() -> tuple[Any, int]:
                 "revision": APP_REVISION,
                 "build": APP_BUILD,
                 "runtime_signature": APP_RUNTIME_SIGNATURE,
+                "help_url": help_url,
             }
         ),
         200,
     )
+
+
+@app.route("/help")
+def help_text() -> tuple[Any, int]:
+    """Plain-text quickstart guide for human operators and agents."""
+    base_url = TP_BASE_URL or request.url_root.rstrip("/")
+    text = _build_help_text(base_url)
+    return Response(text + "\n", mimetype="text/plain"), 200
+
+
+def _build_help_text(base_url: str) -> str:
+    """Build plain-text operator/agent help text for HTTP and slash command use."""
+    sample_pairing = "tp-pair-example-001"
+    sample_url = (
+        "https%3A%2F%2Fdiscord.com%2Fchannels%2F"
+        "269789046635495424%2F355261872024453130%2F1492491000873222225"
+    )
+
+    text = "\n".join(
+        [
+            "tinyPeople Discord Messages API help",
+            "",
+            "Magic Link flow:",
+            "1) Start pairing:",
+            f"{base_url}/oauth/authorize?pairing_id={sample_pairing}",
+            "2) User opens authorize_url from response and approves OAuth in Discord.",
+            "3) Agent claims key:",
+            f"{base_url}/oauth/claim?pairing_id={sample_pairing}&tp_digest=YOUR_DIGEST",
+            "",
+            "Tenant channel policy endpoints (use tp_key):",
+            f"{base_url}/channels/list?tp_key=YOUR_KEY",
+            f"{base_url}/channels/grant?channel_id=355261872024453130&tp_key=YOUR_KEY",
+            f"{base_url}/channels/revoke?channel_id=355261872024453130&tp_key=YOUR_KEY",
+            "",
+            "Message fetch examples:",
+            f"{base_url}/messages?channel_id=355261872024453130&message_id=1492491000873222225&tp_key=YOUR_KEY",
+            f"{base_url}/messages?discord_url={sample_url}&tp_key=YOUR_KEY",
+            f"{base_url}/messages?discord_url={sample_url}&tp_key=YOUR_KEY&tp_debug=1",
+            "",
+            "Health endpoint:",
+            f"{base_url}/health",
+        ]
+    )
+
+    return text
+
+
+def _discord_signature_is_valid(raw_body: bytes) -> bool:
+    """Validate Discord interaction signature headers against raw request body."""
+    if not (VerifyKey and DISCORD_APP_PUBLIC_KEY):
+        return False
+
+    signature = request.headers.get("X-Signature-Ed25519", "").strip()
+    timestamp = request.headers.get("X-Signature-Timestamp", "").strip()
+    if not signature or not timestamp:
+        return False
+
+    try:
+        verify_key = VerifyKey(bytes.fromhex(DISCORD_APP_PUBLIC_KEY))
+        verify_key.verify(timestamp.encode("utf-8") + raw_body, bytes.fromhex(signature))
+        return True
+    except (BadSignatureError, ValueError):
+        return False
+
+
+@app.route("/discord/interactions", methods=["POST"])
+def discord_interactions() -> tuple[Any, int]:
+    """Handle Discord HTTP interactions (PING and /help slash command)."""
+    if not DISCORD_INTERACTIONS_ENABLED:
+        return jsonify({"error": "discord_interactions_disabled"}), 503
+
+    raw_body = request.get_data(cache=False, as_text=False)
+    if not _discord_signature_is_valid(raw_body):
+        return jsonify({"error": "invalid_discord_signature"}), 401
+
+    payload = request.get_json(silent=True) or {}
+    itype = payload.get("type")
+
+    # Discord interaction verification handshake.
+    if itype == 1:
+        return jsonify({"type": 1}), 200
+
+    # Slash command invocation.
+    if itype == 2:
+        command = (payload.get("data") or {}).get("name", "")
+        if command == "help":
+            base_url = TP_BASE_URL or request.url_root.rstrip("/")
+            content = _build_help_text(base_url)
+            # Discord message content limit is 2000 chars.
+            if len(content) > 1900:
+                content = (
+                    "tinyPeople help:\n"
+                    f"{base_url}/help\n"
+                    "Use the /help endpoint for full plain-text instructions."
+                )
+            return jsonify({"type": 4, "data": {"content": content}}), 200
+
+        return jsonify({"type": 4, "data": {"content": "Unknown command."}}), 200
+
+    return jsonify({"error": "unsupported_interaction_type"}), 400
+
+
+@app.route("/discord/commands/sync", methods=["GET"])
+def discord_commands_sync() -> tuple[Any, int]:
+    """Register global slash commands for this app (operator digest auth required)."""
+    try:
+        _authorize_static_digest()
+    except ApiError as exc:
+        return jsonify({"error": exc.message, **(_error_guidance(exc.message) or {})}), exc.status_code
+
+    if not (DISCORD_TOKEN and DISCORD_CLIENT_ID):
+        return jsonify({"error": "discord_command_sync_not_configured"}), 503
+
+    commands = [
+        {
+            "name": "help",
+            "description": "Show tinyPeople API help links",
+        }
+    ]
+
+    try:
+        resp = requests.put(
+            f"https://discord.com/api/v10/applications/{DISCORD_CLIENT_ID}/commands",
+            headers={
+                "Authorization": f"Bot {DISCORD_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            json=commands,
+            timeout=10,
+        )
+    except requests.RequestException as exc:
+        return jsonify({"error": f"discord_command_sync_failed: {type(exc).__name__}"}), 502
+
+    if resp.status_code >= 400:
+        details = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+        return jsonify(
+            {
+                "error": "discord_command_sync_failed",
+                "discord_status": resp.status_code,
+                "discord_message": details.get("message"),
+                "discord_code": details.get("code"),
+            }
+        ), 502
+
+    registered = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else []
+    return jsonify(
+        {
+            "status": "ok",
+            "registered_commands": [item.get("name") for item in registered if isinstance(item, dict)],
+            "count": len(registered) if isinstance(registered, list) else 0,
+            "interactions_url_hint": f"{TP_BASE_URL or request.url_root.rstrip('/')}/discord/interactions",
+        }
+    ), 200
 
 
 @app.route("/health")
@@ -1711,7 +1878,6 @@ def terms() -> tuple[Any, int]:
     TP_SERVICE_NAME = os.getenv("TP_SERVICE_NAME", "tinyPeople Discord Messages API")
     TP_CONTACT_EMAIL = os.getenv("TP_CONTACT_EMAIL", "")
     TP_BASE_URL = os.getenv("TP_BASE_URL", "https://your-domain")
-    from flask import Response
     body = f"""<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="utf-8"><title>Terms of Service — {TP_SERVICE_NAME}</title>
@@ -1759,7 +1925,6 @@ def privacy() -> tuple[Any, int]:
     """Privacy Policy — required by Discord for public OAuth applications."""
     TP_SERVICE_NAME = os.getenv("TP_SERVICE_NAME", "tinyPeople Discord Messages API")
     TP_CONTACT_EMAIL = os.getenv("TP_CONTACT_EMAIL", "")
-    from flask import Response
     body = f"""<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="utf-8"><title>Privacy Policy — {TP_SERVICE_NAME}</title>
