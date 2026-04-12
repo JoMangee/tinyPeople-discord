@@ -143,6 +143,8 @@ _SHOW_ONCE: dict[str, dict] = {}
 # Pairing index for agent-driven Magic Link flow.
 # Maps pairing_id -> show_token so /oauth/claim can look up by pairing_id.
 _PAIRING_INDEX: dict[str, str] = {}
+_LAST_DISCORD_INTERACTION: dict[str, Any] = {}
+_LAST_DISCORD_INTERACTION_LOCK = Lock()
 RECENT_NONCES: dict[str, int] = {}
 MESSAGE_REQUEST_TIMESTAMPS: deque[int] = deque()
 MESSAGE_HOST_SEEN_AT: dict[str, int] = {}
@@ -927,20 +929,50 @@ def discord_interactions() -> tuple[Any, int]:
         return jsonify({"error": "discord_interactions_disabled"}), 503
 
     raw_body = request.get_data(cache=False, as_text=False)
+    decoded_body = raw_body.decode("utf-8", errors="replace") if raw_body else ""
     try:
-        payload = json.loads(raw_body.decode("utf-8")) if raw_body else {}
+        payload = json.loads(decoded_body) if raw_body else {}
     except (ValueError, UnicodeDecodeError):
+        with _LAST_DISCORD_INTERACTION_LOCK:
+            _LAST_DISCORD_INTERACTION.clear()
+            _LAST_DISCORD_INTERACTION.update(
+                {
+                    "ts": int(time.time()),
+                    "status": "invalid_payload",
+                    "content_type": request.headers.get("Content-Type", ""),
+                    "user_agent": request.headers.get("User-Agent", ""),
+                    "has_sig_header": bool(request.headers.get("X-Signature-Ed25519", "").strip()),
+                    "has_ts_header": bool(request.headers.get("X-Signature-Timestamp", "").strip()),
+                    "body_preview": decoded_body[:300],
+                }
+            )
         return jsonify({"error": "invalid_interaction_payload"}), 400
 
     itype = payload.get("type")
+    signature_valid = _discord_signature_is_valid(raw_body)
+    with _LAST_DISCORD_INTERACTION_LOCK:
+        _LAST_DISCORD_INTERACTION.clear()
+        _LAST_DISCORD_INTERACTION.update(
+            {
+                "ts": int(time.time()),
+                "status": "received",
+                "type": itype,
+                "content_type": request.headers.get("Content-Type", ""),
+                "user_agent": request.headers.get("User-Agent", ""),
+                "has_sig_header": bool(request.headers.get("X-Signature-Ed25519", "").strip()),
+                "has_ts_header": bool(request.headers.get("X-Signature-Timestamp", "").strip()),
+                "signature_valid": signature_valid,
+                "body_preview": decoded_body[:300],
+            }
+        )
 
     # Discord interaction verification handshake.
-    if itype == 1:
+    if itype in {1, "1"}:
         # Keep this path permissive so endpoint verification can succeed even
         # before signature config is fully wired.
         return jsonify({"type": 1}), 200
 
-    if not _discord_signature_is_valid(raw_body):
+    if not signature_valid:
         return jsonify({"error": "invalid_discord_signature"}), 401
 
     # Slash command invocation.
@@ -977,6 +1009,22 @@ def discord_interactions_health() -> tuple[Any, int]:
             "endpoint_url": f"{TP_BASE_URL or request.url_root.rstrip('/')}/discord/interactions",
         }
     ), 200
+
+
+@app.route("/discord/interactions/last", methods=["GET"])
+def discord_interactions_last() -> tuple[Any, int]:
+    """Show last interaction request seen by endpoint (operator auth required)."""
+    try:
+        _authorize_static_digest()
+    except ApiError as exc:
+        return jsonify({"error": exc.message, **(_error_guidance(exc.message) or {})}), exc.status_code
+
+    with _LAST_DISCORD_INTERACTION_LOCK:
+        payload = dict(_LAST_DISCORD_INTERACTION)
+
+    if not payload:
+        return jsonify({"status": "no_interactions_seen"}), 200
+    return jsonify(payload), 200
 
 
 @app.route("/discord/commands/sync", methods=["GET"])
