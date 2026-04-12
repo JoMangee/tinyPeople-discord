@@ -11,6 +11,7 @@ import base64
 from collections import deque
 import hmac
 import hashlib
+import json
 import os
 import re
 import secrets
@@ -929,7 +930,11 @@ def discord_interactions() -> tuple[Any, int]:
     if not _discord_signature_is_valid(raw_body):
         return jsonify({"error": "invalid_discord_signature"}), 401
 
-    payload = request.get_json(silent=True) or {}
+    try:
+        payload = json.loads(raw_body.decode("utf-8")) if raw_body else {}
+    except (ValueError, UnicodeDecodeError):
+        return jsonify({"error": "invalid_interaction_payload"}), 400
+
     itype = payload.get("type")
 
     # Discord interaction verification handshake.
