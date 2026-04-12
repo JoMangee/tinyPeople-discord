@@ -880,13 +880,14 @@ def _build_help_text(base_url: str) -> str:
             "tinyPeople Discord Messages API help",
             "",
             "Magic Link flow:",
-            "1) Start pairing:",
+            "1) Agent generates a random pairing_id (example shown) and starts pairing:",
             f"{base_url}/oauth/authorize?pairing_id={sample_pairing}",
             "2) User opens authorize_url from response and approves OAuth in Discord.",
-            "3) Agent claims key:",
-            f"{base_url}/oauth/claim?pairing_id={sample_pairing}&tp_digest=YOUR_DIGEST",
+            "3) Agent claims key using the same pairing_id (no tp_digest or tp_key required):",
+            f"{base_url}/oauth/claim?pairing_id={sample_pairing}",
+            "4) Claim response returns api_key. Use that value as tp_key on /messages and channel-policy routes.",
             "",
-            "Tenant channel policy endpoints (use tp_key):",
+            "Optional tenant channel policy endpoints (after claim, use tp_key):",
             f"{base_url}/channels/list?tp_key=YOUR_KEY",
             f"{base_url}/channels/grant?channel_id=355261872024453130&tp_key=YOUR_KEY",
             f"{base_url}/channels/revoke?channel_id=355261872024453130&tp_key=YOUR_KEY",
@@ -1485,7 +1486,7 @@ def oauth_authorize() -> tuple[Any, int]:
             "claim_url": f"{TP_BASE_URL}/oauth/claim?pairing_id={pairing_id}",
             "hint": (
                 f"Have the user open authorize_url and approve the bot. "
-                f"Then call claim_url with ?tp_digest=YOUR_DIGEST to retrieve the key. "
+                f"Then call claim_url to retrieve the key. "
                 f"The claim window is {TP_OAUTH_SHOW_ONCE_TTL_SECONDS}s after the user authorizes."
             ),
         }), 200
@@ -1654,9 +1655,9 @@ def oauth_claim() -> tuple[Any, int]:
     Part of the agent-driven Magic Link flow:
     1. Agent calls GET /oauth/authorize?pairing_id=RANDOM -> gets authorize_url.
     2. Agent shows the URL to the user; user clicks and authorizes the bot.
-    3. Agent calls GET /oauth/claim?pairing_id=RANDOM&tp_digest=DIGEST -> gets the key.
+    3. Agent calls GET /oauth/claim?pairing_id=RANDOM -> gets the key.
 
-    Requires operator digest auth. One-time retrieval — expires at the same
+    One-time retrieval — expires at the same
     TTL as the show-once token (TP_OAUTH_SHOW_ONCE_TTL_SECONDS after authorization).
 
     Returns 202 if the user has not yet authorized (safe to poll).
@@ -1665,11 +1666,6 @@ def oauth_claim() -> tuple[Any, int]:
     """
     if not TP_OAUTH_ENABLED:
         return jsonify({"error": "oauth_not_enabled"}), 503
-
-    try:
-        _authorize_static_digest()
-    except ApiError as exc:
-        return jsonify({"error": exc.message, **(_error_guidance(exc.message) or {})}), exc.status_code
 
     pairing_id = request.args.get("pairing_id", "").strip()
     if not pairing_id:
