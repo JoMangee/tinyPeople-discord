@@ -6,6 +6,13 @@ A Flask API that reads Discord channel messages via a bot token kept server-side
 
 Branding note: display name is tinyPeople; operational hostnames and filesystem paths are lowercase.
 
+## Quick Start for Humans
+
+Just click the magic link your tinyPeople agent gives you, approve the connection in Discord
+(you choose which servers/channels it can see), and you'll get a personal tp_key in seconds.
+No bot tokens or developer portal needed. Use that key to fetch messages.
+Try it now: ask your tinyNature for a pairing link and you're good to go.
+
 ## Core Endpoints
 
 - GET /messages
@@ -120,6 +127,10 @@ Use /image-chunk for on-demand chunk fetch by URL and index.
 
 ## Minimal Examples
 
+Get a tenant key first via the Magic Link flow, then set:
+
+API_KEY = /oauth/claim response field api_key
+
 Digest mode:
 
 ```text
@@ -136,6 +147,12 @@ Health with key budget info:
 
 ```text
 https://YOUR_DOMAIN/health?tp_key=YOUR_API_KEY
+```
+
+See channels your key can access (public + tenant grants):
+
+```text
+https://YOUR_DOMAIN/channels/list?tp_key=YOUR_API_KEY
 ```
 
 ## Discord Developer Portal URLs
