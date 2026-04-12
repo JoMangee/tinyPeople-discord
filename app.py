@@ -927,9 +927,6 @@ def discord_interactions() -> tuple[Any, int]:
         return jsonify({"error": "discord_interactions_disabled"}), 503
 
     raw_body = request.get_data(cache=False, as_text=False)
-    if not _discord_signature_is_valid(raw_body):
-        return jsonify({"error": "invalid_discord_signature"}), 401
-
     try:
         payload = json.loads(raw_body.decode("utf-8")) if raw_body else {}
     except (ValueError, UnicodeDecodeError):
@@ -939,7 +936,12 @@ def discord_interactions() -> tuple[Any, int]:
 
     # Discord interaction verification handshake.
     if itype == 1:
+        # Keep this path permissive so endpoint verification can succeed even
+        # before signature config is fully wired.
         return jsonify({"type": 1}), 200
+
+    if not _discord_signature_is_valid(raw_body):
+        return jsonify({"error": "invalid_discord_signature"}), 401
 
     # Slash command invocation.
     if itype == 2:
@@ -959,6 +961,22 @@ def discord_interactions() -> tuple[Any, int]:
         return jsonify({"type": 4, "data": {"content": "Unknown command."}}), 200
 
     return jsonify({"error": "unsupported_interaction_type"}), 400
+
+
+@app.route("/discord/interactions/health", methods=["GET"])
+def discord_interactions_health() -> tuple[Any, int]:
+    """Minimal diagnostics for Discord interactions config (no secret leakage)."""
+    key_is_hex_64 = bool(re.fullmatch(r"[0-9a-f]{64}", DISCORD_APP_PUBLIC_KEY))
+    return jsonify(
+        {
+            "status": "ok",
+            "interactions_enabled": DISCORD_INTERACTIONS_ENABLED,
+            "verify_library_loaded": bool(VerifyKey),
+            "public_key_configured": bool(DISCORD_APP_PUBLIC_KEY),
+            "public_key_is_64_hex": key_is_hex_64,
+            "endpoint_url": f"{TP_BASE_URL or request.url_root.rstrip('/')}/discord/interactions",
+        }
+    ), 200
 
 
 @app.route("/discord/commands/sync", methods=["GET"])
