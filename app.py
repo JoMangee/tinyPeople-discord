@@ -922,11 +922,27 @@ def _discord_signature_is_valid(raw_body: bytes) -> bool:
         return False
 
 
-@app.route("/discord/interactions", methods=["POST"])
+@app.route("/discord/interactions", methods=["GET", "HEAD", "OPTIONS", "POST"])
 def discord_interactions() -> tuple[Any, int]:
     """Handle Discord HTTP interactions (PING and /help slash command)."""
     if not DISCORD_INTERACTIONS_ENABLED:
         return jsonify({"error": "discord_interactions_disabled"}), 503
+
+    if request.method in {"GET", "HEAD", "OPTIONS"}:
+        with _LAST_DISCORD_INTERACTION_LOCK:
+            _LAST_DISCORD_INTERACTION.clear()
+            _LAST_DISCORD_INTERACTION.update(
+                {
+                    "ts": int(time.time()),
+                    "status": "probe",
+                    "method": request.method,
+                    "content_type": request.headers.get("Content-Type", ""),
+                    "user_agent": request.headers.get("User-Agent", ""),
+                    "has_sig_header": bool(request.headers.get("X-Signature-Ed25519", "").strip()),
+                    "has_ts_header": bool(request.headers.get("X-Signature-Timestamp", "").strip()),
+                }
+            )
+        return jsonify({"status": "ok", "endpoint": "discord_interactions"}), 200
 
     raw_body = request.get_data(cache=False, as_text=False)
     decoded_body = raw_body.decode("utf-8", errors="replace") if raw_body else ""
