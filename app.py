@@ -134,6 +134,16 @@ try:
 except ValueError:
     TP_OAUTH_SHOW_ONCE_TTL_SECONDS = 300
 TP_OAUTH_SHOW_ONCE_TTL_SECONDS = max(60, min(TP_OAUTH_SHOW_ONCE_TTL_SECONDS, 3600))
+try:
+    TP_OAUTH_STATE_TTL_SECONDS = int(
+        os.getenv(
+            "TP_OAUTH_STATE_TTL_SECONDS",
+            str(TP_OAUTH_SHOW_ONCE_TTL_SECONDS),
+        )
+    )
+except ValueError:
+    TP_OAUTH_STATE_TTL_SECONDS = TP_OAUTH_SHOW_ONCE_TTL_SECONDS
+TP_OAUTH_STATE_TTL_SECONDS = max(60, min(TP_OAUTH_STATE_TTL_SECONDS, 3600))
 
 app = Flask(__name__)
 
@@ -1472,7 +1482,11 @@ def oauth_authorize() -> tuple[Any, int]:
 
     db = get_db()
     state = secrets.token_urlsafe(32)
-    db.store_oauth_state(state, pairing_id=pairing_id)
+    db.store_oauth_state(
+        state,
+        ttl_seconds=TP_OAUTH_STATE_TTL_SECONDS,
+        pairing_id=pairing_id,
+    )
 
     redirect_url = (
         f"https://discord.com/oauth2/authorize"
