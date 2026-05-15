@@ -132,7 +132,13 @@ Enable mention status replies with `MENTION_REPLY_ENABLED=1`.
 
 Endpoint:
 
-- GET /discord/mentions/respond?channel_id=CHANNEL_ID&tp_key=YOUR_API_KEY
+- GET /discord/mentions/respond?channel_id=CHANNEL_ID (with X-TinyPeople-Key header)
+- GET /discord/mentions/respond?channel_id=CHANNEL_ID (with X-TinyPeople-Digest header)
+
+Example auth headers:
+
+- `X-TinyPeople-Key: YOUR_API_KEY`
+- `X-TinyPeople-Digest: YOUR_DIGEST`
 
 Behavior:
 
@@ -177,6 +183,15 @@ TP_KEY=YOUR_API_KEY
 TP_BASE_URL=https://tinypeople.mesh.net.nz
 TP_OUTPUT_MODE=summary
 ./ops/scripts/poll_mentions.sh
+```
+
+Digest-auth usage (when TP_KEY is not configured server-side):
+
+```bash
+TP_AGENT_DIGEST=YOUR_DIGEST
+TP_BASE_URL=https://tinypeople.mesh.net.nz
+TP_OUTPUT_MODE=summary
+./ops/scripts/poll_mentions.sh 1495644139805474907
 ```
 
 Output modes:

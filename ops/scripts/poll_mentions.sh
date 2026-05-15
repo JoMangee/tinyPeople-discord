@@ -5,15 +5,54 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 ENV_FILE="${ENV_FILE:-${REPO_ROOT}/.env}"
 
+load_dotenv_file() {
+  local env_path="$1"
+  local raw_line=""
+  local line=""
+  local name=""
+  local value=""
+
+  while IFS= read -r raw_line || [[ -n "${raw_line}" ]]; do
+    line="${raw_line}"
+    line="${line#"${line%%[![:space:]]*}"}"
+
+    if [[ -z "${line}" || "${line:0:1}" == "#" ]]; then
+      continue
+    fi
+
+    if [[ "${line}" == export* ]]; then
+      line="${line#export }"
+      line="${line#"${line%%[![:space:]]*}"}"
+    fi
+
+    if [[ ! "${line}" =~ ^([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=(.*)$ ]]; then
+      continue
+    fi
+
+    name="${BASH_REMATCH[1]}"
+    value="${BASH_REMATCH[2]}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%$'\r'}"
+
+    if [[ ${#value} -ge 2 && "${value:0:1}" == '"' && "${value: -1}" == '"' ]]; then
+      value="${value:1:${#value}-2}"
+    elif [[ ${#value} -ge 2 && "${value:0:1}" == "'" && "${value: -1}" == "'" ]]; then
+      value="${value:1:${#value}-2}"
+    else
+      value="${value%"${value##*[![:space:]]}"}"
+    fi
+
+    export "${name}=${value}"
+  done < "${env_path}"
+}
+
 if [[ -f "${ENV_FILE}" ]]; then
-  set -a
-  # shellcheck disable=SC1090
-  . "${ENV_FILE}"
-  set +a
+  load_dotenv_file "${ENV_FILE}"
 fi
 
 BASE_URL="${TP_BASE_URL:-https://tinypeople.mesh.net.nz}"
 API_KEY="${TP_KEY:-${TINYPEOPLE_API_KEY:-}}"
+DIGEST_TOKEN="${TP_DIGEST:-${TP_AGENT_DIGEST:-}}"
 SCAN_LIMIT="${TP_SCAN_LIMIT:-20}"
 LOOKBACK_LIMIT="${TP_LOOKBACK_LIMIT:-60}"
 MAX_REPLIES="${TP_MAX_REPLIES:-1}"
@@ -40,7 +79,8 @@ Usage:
   poll_mentions.sh CHANNEL_ID [CHANNEL_ID ...]
 
 Environment:
-  TP_KEY or TINYPEOPLE_API_KEY   Required API key for X-TinyPeople-Key
+  TP_KEY or TINYPEOPLE_API_KEY   Optional API key for X-TinyPeople-Key
+  TP_DIGEST or TP_AGENT_DIGEST   Optional digest for X-TinyPeople-Digest
   TP_BASE_URL                    Optional, defaults to https://tinypeople.mesh.net.nz
   ENV_FILE                       Optional, defaults to REPO_ROOT/.env
   TP_CHANNEL_ID                  Optional single-channel fallback when args are omitted
@@ -53,6 +93,7 @@ Environment:
 
 Examples:
   TP_KEY=your_key ./poll_mentions.sh 1495644139805474907
+  TP_AGENT_DIGEST=your_digest ./poll_mentions.sh 1495644139805474907
   TP_KEY=your_key ./poll_mentions.sh 1495644139805474907 1495644139805474908
   TP_CHANNEL_IDS=1495644139805474907,1495644139805474908 ./poll_mentions.sh
 EOF
@@ -69,8 +110,8 @@ if [[ "${#CHANNEL_IDS[@]}" -eq 0 ]]; then
   exit 2
 fi
 
-if [[ -z "${API_KEY}" ]]; then
-  echo "poll_mentions.sh: set TP_KEY or TINYPEOPLE_API_KEY in the environment or ${ENV_FILE}" >&2
+if [[ -z "${API_KEY}" && -z "${DIGEST_TOKEN}" ]]; then
+  echo "poll_mentions.sh: set TP_KEY/TINYPEOPLE_API_KEY or TP_DIGEST/TP_AGENT_DIGEST in env or ${ENV_FILE}" >&2
   exit 2
 fi
 
@@ -79,7 +120,7 @@ if [[ "${OUTPUT_MODE}" != "full" && "${OUTPUT_MODE}" != "summary" && "${OUTPUT_M
   exit 2
 fi
 
-if [[ "${OUTPUT_MODE}" == "summary" && ! command -v "${PYTHON_BIN}" >/dev/null 2>&1 ]]; then
+if [[ "${OUTPUT_MODE}" == "summary" ]] && ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
   if command -v python >/dev/null 2>&1; then
     PYTHON_BIN="python"
   else
@@ -89,6 +130,16 @@ if [[ "${OUTPUT_MODE}" == "summary" && ! command -v "${PYTHON_BIN}" >/dev/null 2
 fi
 
 FAILURES=0
+AUTH_HEADER_NAME=""
+AUTH_HEADER_VALUE=""
+
+if [[ -n "${API_KEY}" ]]; then
+  AUTH_HEADER_NAME="X-TinyPeople-Key"
+  AUTH_HEADER_VALUE="${API_KEY}"
+else
+  AUTH_HEADER_NAME="X-TinyPeople-Digest"
+  AUTH_HEADER_VALUE="${DIGEST_TOKEN}"
+fi
 
 for raw_channel_id in "${CHANNEL_IDS[@]}"; do
   CHANNEL_ID="$(printf '%s' "${raw_channel_id}" | tr -d '[:space:]')"
@@ -100,7 +151,7 @@ for raw_channel_id in "${CHANNEL_IDS[@]}"; do
   TMP_BODY="$(mktemp)"
 
   HTTP_CODE="$("${CURL_BIN}" -sS -o "${TMP_BODY}" -w "%{http_code}" \
-    -H "X-TinyPeople-Key: ${API_KEY}" \
+    -H "${AUTH_HEADER_NAME}: ${AUTH_HEADER_VALUE}" \
     "${QUERY_URL}")"
 
   if [[ "${OUTPUT_MODE}" == "full" ]]; then
