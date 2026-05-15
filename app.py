@@ -913,57 +913,77 @@ def _fetch_discord_messages_raw(channel_id: str, limit: int) -> list[dict[str, A
         "Authorization": f"Bot {DISCORD_TOKEN}",
         "User-Agent": "tinyPeople-messages-api/0.1.0",
     }
-    params = {"limit": limit}
+    remaining = max(1, limit)
+    before_message_id = ""
+    collected: list[dict[str, Any]] = []
 
-    try:
-        response = requests.get(
-            url,
-            headers=headers,
-            params=params,
-            timeout=DISCORD_HTTP_TIMEOUT_SECONDS,
-        )
-    except requests.RequestException as exc:
-        raise ApiError(
-            "discord_upstream_unreachable",
-            502,
-            debug={"upstream": "discord", "exception": type(exc).__name__},
-        ) from exc
+    while remaining > 0:
+        page_size = min(remaining, 100)
+        params: dict[str, Any] = {"limit": page_size}
+        if before_message_id:
+            params["before"] = before_message_id
 
-    response_body_json: Any | None = None
-    try:
-        response_body_json = response.json()
-    except ValueError:
-        response_body_json = None
+        try:
+            response = requests.get(
+                url,
+                headers=headers,
+                params=params,
+                timeout=DISCORD_HTTP_TIMEOUT_SECONDS,
+            )
+        except requests.RequestException as exc:
+            raise ApiError(
+                "discord_upstream_unreachable",
+                502,
+                debug={"upstream": "discord", "exception": type(exc).__name__},
+            ) from exc
 
-    if response.status_code == 401:
-        raise ApiError("discord_token_rejected", 502, debug={"discord_status": 401})
-    if response.status_code == 403:
-        debug = {"discord_status": 403}
-        if isinstance(response_body_json, dict):
-            debug["discord_code"] = response_body_json.get("code")
-            debug["discord_message"] = response_body_json.get("message")
-        raise ApiError("discord_forbidden_channel", 403, debug=debug)
-    if response.status_code == 404:
-        debug = {"discord_status": 404}
-        if isinstance(response_body_json, dict):
-            debug["discord_code"] = response_body_json.get("code")
-            debug["discord_message"] = response_body_json.get("message")
-        raise ApiError("discord_channel_not_found", 404, debug=debug)
-    if response.status_code >= 400:
-        debug = {"discord_status": response.status_code}
-        if isinstance(response_body_json, dict):
-            debug["discord_code"] = response_body_json.get("code")
-            debug["discord_message"] = response_body_json.get("message")
-        raise ApiError("discord_upstream_error", 502, debug=debug)
+        response_body_json: Any | None = None
+        try:
+            response_body_json = response.json()
+        except ValueError:
+            response_body_json = None
 
-    if not isinstance(response_body_json, list):
-        raise ApiError(
-            "discord_unexpected_payload",
-            502,
-            debug={"discord_status": response.status_code, "payload_type": type(response_body_json).__name__},
-        )
+        if response.status_code == 401:
+            raise ApiError("discord_token_rejected", 502, debug={"discord_status": 401})
+        if response.status_code == 403:
+            debug = {"discord_status": 403}
+            if isinstance(response_body_json, dict):
+                debug["discord_code"] = response_body_json.get("code")
+                debug["discord_message"] = response_body_json.get("message")
+            raise ApiError("discord_forbidden_channel", 403, debug=debug)
+        if response.status_code == 404:
+            debug = {"discord_status": 404}
+            if isinstance(response_body_json, dict):
+                debug["discord_code"] = response_body_json.get("code")
+                debug["discord_message"] = response_body_json.get("message")
+            raise ApiError("discord_channel_not_found", 404, debug=debug)
+        if response.status_code >= 400:
+            debug = {"discord_status": response.status_code}
+            if isinstance(response_body_json, dict):
+                debug["discord_code"] = response_body_json.get("code")
+                debug["discord_message"] = response_body_json.get("message")
+            raise ApiError("discord_upstream_error", 502, debug=debug)
 
-    return [item for item in response_body_json if isinstance(item, dict)]
+        if not isinstance(response_body_json, list):
+            raise ApiError(
+                "discord_unexpected_payload",
+                502,
+                debug={"discord_status": response.status_code, "payload_type": type(response_body_json).__name__},
+            )
+
+        page_items = [item for item in response_body_json if isinstance(item, dict)]
+        collected.extend(page_items)
+        remaining -= len(page_items)
+
+        if not page_items or len(page_items) < page_size:
+            break
+
+        last_id = str(page_items[-1].get("id", "")).strip()
+        if not last_id:
+            break
+        before_message_id = last_id
+
+    return collected[:limit]
 
 
 def _fetch_discord_bot_user_id() -> str:
