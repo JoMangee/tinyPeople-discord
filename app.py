@@ -1057,6 +1057,34 @@ def _message_mentions_bot(message: dict[str, Any], bot_user_id: str) -> bool:
     return f"<@{bot_user_id}>" in content or f"<@!{bot_user_id}>" in content
 
 
+def _bot_already_replied_to_message(
+    *,
+    mention_message_id: str,
+    bot_user_id: str,
+    channel_history: list[dict[str, Any]],
+) -> bool:
+    """Check channel history for an existing bot reply tied to the mention message.
+
+    This survives process restarts because the signal is in Discord history,
+    not local in-memory cooldown state.
+    """
+    for item in channel_history:
+        author = item.get("author") if isinstance(item.get("author"), dict) else {}
+        if str(author.get("id", "")).strip() != bot_user_id:
+            continue
+
+        reference = (
+            item.get("message_reference")
+            if isinstance(item.get("message_reference"), dict)
+            else {}
+        )
+        referenced_id = str(reference.get("message_id", "")).strip()
+        if referenced_id and referenced_id == mention_message_id:
+            return True
+
+    return False
+
+
 def _prune_mention_replied_cache(now: int) -> None:
     """Drop mention IDs outside cooldown window to avoid unbounded memory usage."""
     cutoff = now - MENTION_REPLY_COOLDOWN_SECONDS
@@ -1572,6 +1600,15 @@ def discord_mentions_respond() -> tuple[Any, int]:
                 continue
 
             if not _message_mentions_bot(message, bot_user_id):
+                continue
+
+            if _bot_already_replied_to_message(
+                mention_message_id=message_id,
+                bot_user_id=bot_user_id,
+                channel_history=history,
+            ):
+                skipped.append({"message_id": message_id, "reason": "already_replied_in_history"})
+                _mark_mention_replied(message_id)
                 continue
 
             if _is_mention_replied(message_id):
