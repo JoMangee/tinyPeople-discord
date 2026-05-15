@@ -1124,22 +1124,70 @@ def _post_discord_message_reply(
     if not DISCORD_TOKEN:
         raise ApiError("server_missing_discord_token", 503)
 
-    if status["active"]:
-        status_text = (
-            f"you look active here with {status['message_count_in_lookback']} message(s) "
-            f"in the most recent {status['lookback_messages']} messages."
-        )
-    else:
-        status_text = (
-            f"you look less active right now ({status['message_count_in_lookback']} message(s) "
-            f"in the most recent {status['lookback_messages']} messages)."
-        )
+    def _plural(value: int, singular: str, plural: str) -> str:
+        return singular if value == 1 else plural
 
-    content = (
-        f"<@{user_id}> status check: {status_text} "
-        f"Active threshold is {status['active_threshold']['min_messages']}+ messages "
-        f"within {status['active_threshold']['window_seconds']} seconds."
+    def _human_duration(seconds: int | None) -> str:
+        if seconds is None:
+            return "unknown time"
+        if seconds < 60:
+            return f"{seconds} {_plural(seconds, 'second', 'seconds')}"
+        if seconds < 3600:
+            minutes = max(1, seconds // 60)
+            return f"{minutes} {_plural(minutes, 'minute', 'minutes')}"
+        if seconds < 86400:
+            hours = max(1, seconds // 3600)
+            return f"{hours} {_plural(hours, 'hour', 'hours')}"
+        days = max(1, seconds // 86400)
+        return f"{days} {_plural(days, 'day', 'days')}"
+
+    message_count = int(status.get("message_count_in_lookback", 0))
+    lookback_messages = int(status.get("lookback_messages", 0))
+    latest_age_seconds = status.get("latest_message_age_seconds")
+    active = bool(status.get("active", False))
+    min_messages = int(status.get("active_threshold", {}).get("min_messages", MENTION_ACTIVE_MIN_MESSAGES))
+    window_seconds = int(status.get("active_threshold", {}).get("window_seconds", MENTION_ACTIVE_WINDOW_SECONDS))
+
+    if active:
+        if isinstance(latest_age_seconds, int) and latest_age_seconds <= 300:
+            status_text = (
+                f"Loud and clear. You are definitely active right now - "
+                f"{message_count} recent {_plural(message_count, 'message', 'messages')} from you."
+            )
+        else:
+            recency = _human_duration(latest_age_seconds if isinstance(latest_age_seconds, int) else None)
+            status_text = (
+                f"I hear you. You are active here - I can see {message_count} recent "
+                f"{_plural(message_count, 'message', 'messages')} and your latest was about {recency} ago."
+            )
+    else:
+        hour_window = _human_duration(window_seconds)
+        inactive_variants = [
+            (
+                f"I hear you. You have only sent a couple messages recently though - "
+                f"I was starting to think you were lurking. "
+                f"({message_count} in the last {lookback_messages} messages.)"
+            ),
+            (
+                f"Loud and clear. Was starting to wonder if you had gone quiet though - "
+                f"only {message_count} {_plural(message_count, 'message', 'messages')} "
+                f"from you in the last {hour_window} keeps you under my chatter threshold."
+            ),
+            (
+                f"Yeah, I see you. Barely. {message_count} "
+                f"{_plural(message_count, 'message', 'messages')} in the last {hour_window} "
+                "does not exactly scream active."
+            ),
+        ]
+        variant_index = message_count % len(inactive_variants)
+        status_text = inactive_variants[variant_index]
+
+    threshold_text = (
+        f"Threshold: {min_messages}+ {_plural(min_messages, 'message', 'messages')} "
+        f"within {_human_duration(window_seconds)}."
     )
+
+    content = f"<@{user_id}> {status_text} {threshold_text}"
 
     try:
         response = requests.post(
