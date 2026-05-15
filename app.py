@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 from collections import deque
+from datetime import datetime, timezone
 import hmac
 import hashlib
 import json
@@ -89,6 +90,19 @@ RAW_IMAGE_MAX_ATTACHMENTS = int(os.getenv("RAW_IMAGE_MAX_ATTACHMENTS", "3"))
 DEFAULT_MESSAGE_LIMIT = int(os.getenv("DEFAULT_MESSAGE_LIMIT", "20"))
 MAX_MESSAGE_LIMIT = int(os.getenv("MAX_MESSAGE_LIMIT", "50"))
 DISCORD_HTTP_TIMEOUT_SECONDS = float(os.getenv("DISCORD_HTTP_TIMEOUT_SECONDS", "15"))
+MENTION_REPLY_ENABLED = (
+    os.getenv("MENTION_REPLY_ENABLED", "0").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+DISCORD_BOT_USER_ID = os.getenv("DISCORD_BOT_USER_ID", "").strip()
+MENTION_REPLY_SCAN_LIMIT = int(os.getenv("MENTION_REPLY_SCAN_LIMIT", "20"))
+MENTION_REPLY_LOOKBACK_LIMIT = int(os.getenv("MENTION_REPLY_LOOKBACK_LIMIT", "60"))
+MENTION_ACTIVE_MIN_MESSAGES = int(os.getenv("MENTION_ACTIVE_MIN_MESSAGES", "3"))
+MENTION_ACTIVE_WINDOW_SECONDS = int(os.getenv("MENTION_ACTIVE_WINDOW_SECONDS", "3600"))
+MENTION_REPLY_COOLDOWN_SECONDS = int(os.getenv("MENTION_REPLY_COOLDOWN_SECONDS", "21600"))
+MENTION_REPLY_MAX_RESPONSES_PER_RUN = int(
+    os.getenv("MENTION_REPLY_MAX_RESPONSES_PER_RUN", "1")
+)
 
 ALLOWED_CHANNEL_IDS = {
     channel_id.strip()
@@ -159,6 +173,9 @@ RECENT_NONCES: dict[str, int] = {}
 MESSAGE_REQUEST_TIMESTAMPS: deque[int] = deque()
 MESSAGE_HOST_SEEN_AT: dict[str, int] = {}
 MESSAGE_METRICS_LOCK = Lock()
+MENTION_REPLIED_AT: dict[str, int] = {}
+MENTION_REPLIED_AT_LOCK = Lock()
+_BOT_USER_ID_CACHE: str | None = None
 
 
 @dataclass
@@ -202,6 +219,21 @@ def _error_guidance(error_code: str) -> dict[str, Any] | None:
         return {
             "hint": f"limit must be an integer between 1 and {MAX_MESSAGE_LIMIT}.",
             "next_step": "Retry with a valid limit value.",
+        }
+    if error_code == "invalid_scan_limit":
+        return {
+            "hint": "scan_limit must be an integer between 1 and 100.",
+            "next_step": "Retry with scan_limit=20 (or another value in range).",
+        }
+    if error_code == "invalid_lookback_limit":
+        return {
+            "hint": "lookback_limit must be an integer between scan_limit and 200.",
+            "next_step": "Retry with lookback_limit=60 (or another value in range).",
+        }
+    if error_code == "invalid_max_replies":
+        return {
+            "hint": "max_replies must be an integer between 1 and 3.",
+            "next_step": "Retry with max_replies=1.",
         }
     if error_code in {"invalid_api_key", "missing_api_key"}:
         return {
@@ -552,6 +584,28 @@ def _parse_limit(limit_raw: str | None) -> int:
     return limit
 
 
+def _parse_bounded_int(
+    raw_value: str | None,
+    *,
+    default: int,
+    min_value: int,
+    max_value: int,
+    error_name: str,
+) -> int:
+    """Parse an optional integer and constrain it to a configured range."""
+    if not raw_value:
+        return default
+
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise ApiError(error_name, 400) from exc
+
+    if value < min_value or value > max_value:
+        raise ApiError(error_name, 400)
+    return value
+
+
 def _validate_channel_id(channel_id_raw: str | None) -> str:
     """Validate channel_id parameter and optional allowlist."""
     if not channel_id_raw:
@@ -849,6 +903,271 @@ def _fetch_discord_messages(
     return [_normalize_message(msg, include_raw_images=include_raw_images) for msg in data]
 
 
+def _fetch_discord_messages_raw(channel_id: str, limit: int) -> list[dict[str, Any]]:
+    """Read raw Discord message payloads for mention/status workflows."""
+    if not DISCORD_TOKEN:
+        raise ApiError("server_missing_discord_token", 503)
+
+    url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
+    headers = {
+        "Authorization": f"Bot {DISCORD_TOKEN}",
+        "User-Agent": "tinyPeople-messages-api/0.1.0",
+    }
+    params = {"limit": limit}
+
+    try:
+        response = requests.get(
+            url,
+            headers=headers,
+            params=params,
+            timeout=DISCORD_HTTP_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException as exc:
+        raise ApiError(
+            "discord_upstream_unreachable",
+            502,
+            debug={"upstream": "discord", "exception": type(exc).__name__},
+        ) from exc
+
+    response_body_json: Any | None = None
+    try:
+        response_body_json = response.json()
+    except ValueError:
+        response_body_json = None
+
+    if response.status_code == 401:
+        raise ApiError("discord_token_rejected", 502, debug={"discord_status": 401})
+    if response.status_code == 403:
+        debug = {"discord_status": 403}
+        if isinstance(response_body_json, dict):
+            debug["discord_code"] = response_body_json.get("code")
+            debug["discord_message"] = response_body_json.get("message")
+        raise ApiError("discord_forbidden_channel", 403, debug=debug)
+    if response.status_code == 404:
+        debug = {"discord_status": 404}
+        if isinstance(response_body_json, dict):
+            debug["discord_code"] = response_body_json.get("code")
+            debug["discord_message"] = response_body_json.get("message")
+        raise ApiError("discord_channel_not_found", 404, debug=debug)
+    if response.status_code >= 400:
+        debug = {"discord_status": response.status_code}
+        if isinstance(response_body_json, dict):
+            debug["discord_code"] = response_body_json.get("code")
+            debug["discord_message"] = response_body_json.get("message")
+        raise ApiError("discord_upstream_error", 502, debug=debug)
+
+    if not isinstance(response_body_json, list):
+        raise ApiError(
+            "discord_unexpected_payload",
+            502,
+            debug={"discord_status": response.status_code, "payload_type": type(response_body_json).__name__},
+        )
+
+    return [item for item in response_body_json if isinstance(item, dict)]
+
+
+def _fetch_discord_bot_user_id() -> str:
+    """Resolve the bot account user ID, using env override then Discord /users/@me."""
+    global _BOT_USER_ID_CACHE
+    if DISCORD_BOT_USER_ID:
+        return DISCORD_BOT_USER_ID
+    if _BOT_USER_ID_CACHE:
+        return _BOT_USER_ID_CACHE
+
+    if not DISCORD_TOKEN:
+        raise ApiError("server_missing_discord_token", 503)
+
+    try:
+        response = requests.get(
+            "https://discord.com/api/v10/users/@me",
+            headers={
+                "Authorization": f"Bot {DISCORD_TOKEN}",
+                "User-Agent": "tinyPeople-messages-api/0.1.0",
+            },
+            timeout=DISCORD_HTTP_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException as exc:
+        raise ApiError(
+            "discord_upstream_unreachable",
+            502,
+            debug={"upstream": "discord", "exception": type(exc).__name__},
+        ) from exc
+
+    data: Any | None = None
+    try:
+        data = response.json()
+    except ValueError:
+        data = None
+
+    if response.status_code >= 400:
+        raise ApiError("discord_bot_identity_unavailable", 502, debug={"discord_status": response.status_code})
+    if not isinstance(data, dict) or not str(data.get("id", "")).strip().isdigit():
+        raise ApiError("discord_bot_identity_unavailable", 502)
+
+    _BOT_USER_ID_CACHE = str(data["id"]).strip()
+    return _BOT_USER_ID_CACHE
+
+
+def _discord_iso_age_seconds(iso_ts: str) -> int | None:
+    """Convert Discord ISO timestamp to seconds elapsed from now."""
+    if not iso_ts:
+        return None
+    try:
+        parsed = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    now_utc = datetime.now(timezone.utc)
+    delta = now_utc - parsed
+    return max(0, int(delta.total_seconds()))
+
+
+def _message_mentions_bot(message: dict[str, Any], bot_user_id: str) -> bool:
+    """Check whether a Discord message mentions this bot account."""
+    mentions = message.get("mentions")
+    if isinstance(mentions, list):
+        for mention in mentions:
+            if not isinstance(mention, dict):
+                continue
+            if str(mention.get("id", "")).strip() == bot_user_id:
+                return True
+
+    content = str(message.get("content") or "")
+    return f"<@{bot_user_id}>" in content or f"<@!{bot_user_id}>" in content
+
+
+def _prune_mention_replied_cache(now: int) -> None:
+    """Drop mention IDs outside cooldown window to avoid unbounded memory usage."""
+    cutoff = now - MENTION_REPLY_COOLDOWN_SECONDS
+    stale = [message_id for message_id, ts in MENTION_REPLIED_AT.items() if ts < cutoff]
+    for message_id in stale:
+        MENTION_REPLIED_AT.pop(message_id, None)
+
+
+def _is_mention_replied(message_id: str) -> bool:
+    """Return True when this mention message was already handled recently."""
+    now = int(time.time())
+    with MENTION_REPLIED_AT_LOCK:
+        _prune_mention_replied_cache(now)
+        return message_id in MENTION_REPLIED_AT
+
+
+def _mark_mention_replied(message_id: str) -> None:
+    """Mark mention message as handled to prevent duplicate bot replies."""
+    now = int(time.time())
+    with MENTION_REPLIED_AT_LOCK:
+        _prune_mention_replied_cache(now)
+        MENTION_REPLIED_AT[message_id] = now
+
+
+def _build_user_activity_status(
+    user_id: str,
+    channel_history: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Build an activity snapshot for a user based on recent channel history."""
+    user_messages = [
+        msg
+        for msg in channel_history
+        if isinstance(msg.get("author"), dict)
+        and str(msg["author"].get("id", "")).strip() == user_id
+    ]
+    message_count = len(user_messages)
+    latest_timestamp = str(user_messages[0].get("timestamp") or "") if user_messages else ""
+    latest_age_seconds = _discord_iso_age_seconds(latest_timestamp) if latest_timestamp else None
+    is_active = (
+        message_count >= MENTION_ACTIVE_MIN_MESSAGES
+        and latest_age_seconds is not None
+        and latest_age_seconds <= MENTION_ACTIVE_WINDOW_SECONDS
+    )
+
+    return {
+        "user_id": user_id,
+        "message_count_in_lookback": message_count,
+        "lookback_messages": len(channel_history),
+        "latest_message_age_seconds": latest_age_seconds,
+        "active": is_active,
+        "active_threshold": {
+            "min_messages": MENTION_ACTIVE_MIN_MESSAGES,
+            "window_seconds": MENTION_ACTIVE_WINDOW_SECONDS,
+        },
+    }
+
+
+def _post_discord_message_reply(
+    channel_id: str,
+    reference_message_id: str,
+    user_id: str,
+    status: dict[str, Any],
+) -> None:
+    """Post a Discord threaded reply describing the caller's recent activity."""
+    if not DISCORD_TOKEN:
+        raise ApiError("server_missing_discord_token", 503)
+
+    if status["active"]:
+        status_text = (
+            f"you look active here with {status['message_count_in_lookback']} message(s) "
+            f"in the most recent {status['lookback_messages']} messages."
+        )
+    else:
+        status_text = (
+            f"you look less active right now ({status['message_count_in_lookback']} message(s) "
+            f"in the most recent {status['lookback_messages']} messages)."
+        )
+
+    content = (
+        f"<@{user_id}> status check: {status_text} "
+        f"Active threshold is {status['active_threshold']['min_messages']}+ messages "
+        f"within {status['active_threshold']['window_seconds']} seconds."
+    )
+
+    try:
+        response = requests.post(
+            f"https://discord.com/api/v10/channels/{channel_id}/messages",
+            headers={
+                "Authorization": f"Bot {DISCORD_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "content": content,
+                "message_reference": {
+                    "message_id": reference_message_id,
+                    "channel_id": channel_id,
+                },
+                "allowed_mentions": {
+                    "parse": [],
+                    "users": [user_id],
+                    "replied_user": True,
+                },
+            },
+            timeout=DISCORD_HTTP_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException as exc:
+        raise ApiError(
+            "discord_upstream_unreachable",
+            502,
+            debug={"upstream": "discord", "exception": type(exc).__name__},
+        ) from exc
+
+    if response.status_code >= 400:
+        details: dict[str, Any] = {}
+        try:
+            body = response.json()
+            if isinstance(body, dict):
+                details = {
+                    "discord_code": body.get("code"),
+                    "discord_message": body.get("message"),
+                }
+        except ValueError:
+            details = {}
+
+        raise ApiError(
+            "discord_reply_failed",
+            502,
+            debug={"discord_status": response.status_code, **details},
+        )
+
+
 @app.route("/")
 def home() -> tuple[Any, int]:
     """Operator-facing status endpoint."""
@@ -1112,6 +1431,119 @@ def discord_commands_sync() -> tuple[Any, int]:
             "interactions_url_hint": f"{TP_BASE_URL or request.url_root.rstrip('/')}/discord/interactions",
         }
     ), 200
+
+
+@app.route("/discord/mentions/respond", methods=["GET"])
+def discord_mentions_respond() -> tuple[Any, int]:
+    """Reply to recent bot mentions with a lightweight user activity status."""
+    if not MENTION_REPLY_ENABLED:
+        return jsonify({"error": "mention_reply_disabled"}), 503
+
+    channel_id = None
+    try:
+        auth_context, is_key_based = _resolve_auth_context()
+        channel_id = _validate_channel_id(request.args.get("channel_id"))
+
+        if not is_key_based:
+            _authorize_request(channel_id, 1)
+
+        if auth_context and auth_context.tenant_id and get_db:
+            db = get_db()
+            if (
+                channel_id not in TP_PUBLIC_CHANNEL_IDS
+                and not db.is_channel_allowed_for_tenant(auth_context.tenant_id, channel_id)
+            ):
+                raise ApiError("channel_not_allowed_for_tenant", 403)
+
+        scan_limit = _parse_bounded_int(
+            request.args.get("scan_limit"),
+            default=min(max(1, MENTION_REPLY_SCAN_LIMIT), 100),
+            min_value=1,
+            max_value=100,
+            error_name="invalid_scan_limit",
+        )
+
+        lookback_limit = _parse_bounded_int(
+            request.args.get("lookback_limit"),
+            default=min(max(MENTION_REPLY_LOOKBACK_LIMIT, scan_limit), 200),
+            min_value=max(1, scan_limit),
+            max_value=200,
+            error_name="invalid_lookback_limit",
+        )
+
+        max_replies_raw = request.args.get("max_replies", "").strip()
+        if max_replies_raw:
+            try:
+                max_replies = int(max_replies_raw)
+            except ValueError as exc:
+                raise ApiError("invalid_max_replies", 400) from exc
+        else:
+            max_replies = MENTION_REPLY_MAX_RESPONSES_PER_RUN
+        max_replies = max(1, min(max_replies, 3))
+
+        recent_for_mentions = _fetch_discord_messages_raw(channel_id, scan_limit)
+        history = _fetch_discord_messages_raw(channel_id, lookback_limit)
+        bot_user_id = _fetch_discord_bot_user_id()
+
+        # Discord returns newest-first; process oldest-first for natural reply order.
+        candidates = list(reversed(recent_for_mentions))
+        replies: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+
+        for message in candidates:
+            if len(replies) >= max_replies:
+                break
+
+            message_id = str(message.get("id", "")).strip()
+            if not message_id:
+                continue
+
+            author = message.get("author") if isinstance(message.get("author"), dict) else {}
+            author_id = str(author.get("id", "")).strip()
+            if not author_id or author_id == bot_user_id:
+                continue
+
+            if not _message_mentions_bot(message, bot_user_id):
+                continue
+
+            if _is_mention_replied(message_id):
+                skipped.append({"message_id": message_id, "reason": "already_replied_recently"})
+                continue
+
+            status = _build_user_activity_status(author_id, history)
+            _post_discord_message_reply(channel_id, message_id, author_id, status)
+            _mark_mention_replied(message_id)
+            replies.append(
+                {
+                    "message_id": message_id,
+                    "user_id": author_id,
+                    "activity_status": status,
+                }
+            )
+
+        return jsonify(
+            {
+                "status": "ok",
+                "channel_id": channel_id,
+                "scan_limit": scan_limit,
+                "lookback_limit": lookback_limit,
+                "max_replies": max_replies,
+                "reply_count": len(replies),
+                "replies": replies,
+                "skipped": skipped,
+            }
+        ), 200
+
+    except ApiError as exc:
+        payload: dict[str, Any] = {"error": exc.message}
+        guidance = _error_guidance(exc.message)
+        if guidance:
+            payload.update(guidance)
+        if exc.debug:
+            payload["debug"] = exc.debug
+        if channel_id:
+            payload["channel_id"] = channel_id
+        return jsonify(payload), exc.status_code
 
 
 @app.route("/health")

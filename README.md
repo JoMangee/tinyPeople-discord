@@ -18,6 +18,7 @@ Try it now: ask your tinyNature for a pairing link and you're good to go.
 - GET /messages
 - GET /image-chunk
 - GET /health
+- GET /discord/mentions/respond
 - GET /oauth/authorize
 - GET /oauth/callback
 - GET /oauth/key
@@ -124,6 +125,71 @@ Each raw_images entry contains:
 - chunks (ordered base64 segments)
 
 Use /image-chunk for on-demand chunk fetch by URL and index.
+
+## Mention Status Replies
+
+Enable mention status replies with `MENTION_REPLY_ENABLED=1`.
+
+Endpoint:
+
+- GET /discord/mentions/respond?channel_id=CHANNEL_ID&tp_key=YOUR_API_KEY
+
+Behavior:
+
+- Scans recent messages for mentions of the bot.
+- Replies in-thread to mention messages with a lightweight activity status
+  for the user who mentioned the bot.
+- Uses cooldown tracking to avoid duplicate replies to the same mention.
+
+Optional query params:
+
+- scan_limit (1..100, default from env)
+- lookback_limit (scan_limit..200, default from env)
+- max_replies (1..3, default from env)
+
+Bash helper:
+
+- [ops/scripts/poll_mentions.sh](ops/scripts/poll_mentions.sh)
+
+Behavior:
+
+- Loads [ops/scripts/poll_mentions.sh](ops/scripts/poll_mentions.sh) settings from the repo `.env` by default.
+- Accepts one or more channel IDs as positional arguments.
+- Can also read `TP_CHANNEL_IDS` from `.env` as a comma-separated list.
+
+Example usage:
+
+```bash
+TP_KEY=YOUR_API_KEY ./ops/scripts/poll_mentions.sh 1495644139805474907
+```
+
+Multiple channels in one run:
+
+```bash
+./ops/scripts/poll_mentions.sh 1495644139805474907 1495644139805474908
+```
+
+`.env`-driven usage:
+
+```bash
+TP_CHANNEL_IDS=1495644139805474907,1495644139805474908
+TP_KEY=YOUR_API_KEY
+TP_BASE_URL=https://tinypeople.mesh.net.nz
+TP_OUTPUT_MODE=summary
+./ops/scripts/poll_mentions.sh
+```
+
+Output modes:
+
+- `full`: print each full JSON response
+- `summary`: print one compact line per channel
+- `failures`: only print response bodies for non-2xx requests
+
+Example crontab:
+
+```cron
+* * * * * TP_OUTPUT_MODE=summary /usr/bin/env bash /home/USERNAME/APPDOMAIN/ops/scripts/poll_mentions.sh 1495644139805474907 1495644139805474908 >> /home/USERNAME/tinyPeople-mentions.log 2>&1
+```
 
 ## Minimal Examples
 
