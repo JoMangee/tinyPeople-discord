@@ -148,6 +148,12 @@ Behavior:
 - `mode=query` is read-only and returns mention candidates + activity status.
 - Uses cooldown tracking and Discord-history checks to avoid duplicate replies.
 
+How to use it:
+
+1. Query first to find the mention you want to answer.
+2. Copy that candidate's `message_id` into the respond call.
+3. If the mention is older than the default scan window, raise `scan_limit` and keep `lookback_limit` at or above it.
+
 Optional query params:
 
 - scan_limit (1..100, default from env)
@@ -161,6 +167,11 @@ Query mode returns:
 
 - `candidates[]` with `message_id`, `user_id`, `mention_content`, `timestamp`, light `author` metadata, and `activity_status`
 - `most_recent_mention` supplementary context with `message_id` and `recent_message_preview`
+
+Important:
+
+- `message_ids` is the Discord message ID of the mention, not the channel ID.
+- `mode=respond` will only target messages that are still inside the scan window.
 
 Mode examples:
 
