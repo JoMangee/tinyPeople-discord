@@ -181,7 +181,7 @@ function Invoke-SafeCpanelPush {
     if ($sourceSubject.Length -gt 90) {
         $sourceSubject = $sourceSubject.Substring(0, 90) + "..."
     }
-    $overlayCommitMessage = "cPanel deploy overlay for $sourceSha: $sourceSubject"
+    $overlayCommitMessage = "cPanel deploy overlay for ${sourceSha}: $sourceSubject"
 
     Write-Host "Using temporary worktree deploy branch with local .cpanel.yml.local overlay."
     git -C $RepoRoot worktree prune | Out-Null
