@@ -168,6 +168,20 @@ function Invoke-SafeCpanelPush {
 
     $worktreePath = Join-Path $RepoRoot ".git\cpanel-deploy-worktree"
     $worktreeBranch = "cpanel-deploy-local"
+    $sourceShaRaw = git -C $RepoRoot rev-parse --short HEAD
+    $sourceSha = (($sourceShaRaw | Out-String).Trim())
+    $sourceSubjectRaw = git -C $RepoRoot log -1 --pretty=%s
+    $sourceSubject = (($sourceSubjectRaw | Out-String).Trim())
+    if (-not $sourceSha) {
+        $sourceSha = "unknown-sha"
+    }
+    if (-not $sourceSubject) {
+        $sourceSubject = "unknown-subject"
+    }
+    if ($sourceSubject.Length -gt 90) {
+        $sourceSubject = $sourceSubject.Substring(0, 90) + "..."
+    }
+    $overlayCommitMessage = "cPanel deploy overlay for $sourceSha: $sourceSubject"
 
     Write-Host "Using temporary worktree deploy branch with local .cpanel.yml.local overlay."
     git -C $RepoRoot worktree prune | Out-Null
@@ -195,7 +209,8 @@ function Invoke-SafeCpanelPush {
         $pendingRaw = git -C $worktreePath status --porcelain -- .cpanel.yml
         $pending = (($pendingRaw | Out-String).Trim())
         if ($pending) {
-            git -C $worktreePath commit -m "cPanel local deploy overlay (non-GitHub)" | Out-Null
+            Write-Host "Overlay commit message: $overlayCommitMessage"
+            git -C $worktreePath commit -m $overlayCommitMessage | Out-Null
         }
 
         Write-Host "Running: git push --force-with-lease $RemoteName HEAD:$RemoteRef"
