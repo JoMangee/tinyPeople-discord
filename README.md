@@ -143,15 +143,34 @@ Example auth headers:
 Behavior:
 
 - Scans recent messages for mentions of the bot.
-- Replies in-thread to mention messages with a lightweight activity status
-  for the user who mentioned the bot.
-- Uses cooldown tracking to avoid duplicate replies to the same mention.
+- Supports `mode=respond` (default) and `mode=query`.
+- `mode=respond` replies in-thread to mention messages.
+- `mode=query` is read-only and returns mention candidates + activity status.
+- Uses cooldown tracking and Discord-history checks to avoid duplicate replies.
 
 Optional query params:
 
 - scan_limit (1..100, default from env)
 - lookback_limit (scan_limit..200, default from env)
 - max_replies (1..3, default from env)
+- mode (`query` or `respond`, default `respond`)
+- message_ids (optional comma-separated Discord message IDs to target in `respond` mode)
+- reply_message (optional caller-authored text in `respond` mode)
+
+Query mode returns:
+
+- `candidates[]` with `message_id`, `user_id`, `mention_content`, `timestamp`, light `author` metadata, and `activity_status`
+- `most_recent_mention` supplementary context with `message_id` and `recent_message_preview`
+
+Mode examples:
+
+```text
+GET /discord/mentions/respond?channel_id=CHANNEL_ID&mode=query&tp_key=YOUR_API_KEY
+```
+
+```text
+GET /discord/mentions/respond?channel_id=CHANNEL_ID&mode=respond&message_ids=MESSAGE_ID&reply_message=I%20am%20here%20and%20I%20can%20read%20this%20channel.&tp_key=YOUR_API_KEY
+```
 
 Bash helper:
 

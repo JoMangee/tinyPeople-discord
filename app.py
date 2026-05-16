@@ -235,6 +235,16 @@ def _error_guidance(error_code: str) -> dict[str, Any] | None:
             "hint": "max_replies must be an integer between 1 and 3.",
             "next_step": "Retry with max_replies=1.",
         }
+    if error_code == "invalid_mention_mode":
+        return {
+            "hint": "mode must be either query or respond.",
+            "next_step": "Retry with mode=query (read-only) or mode=respond (post replies).",
+        }
+    if error_code == "invalid_message_ids":
+        return {
+            "hint": "message_ids must be comma-separated numeric Discord message IDs.",
+            "next_step": "Retry with message_ids=1234567890,1234567891.",
+        }
     if error_code in {"invalid_api_key", "missing_api_key"}:
         return {
             "hint": "Provide a valid tenant key as tp_key (or X-TinyPeople-Key).",
@@ -1142,15 +1152,104 @@ def _build_user_activity_status(
     }
 
 
-def _post_discord_message_reply(
-    channel_id: str,
-    reference_message_id: str,
+def _build_recent_message_preview(
     user_id: str,
-    status: dict[str, Any],
-) -> None:
-    """Post a Discord threaded reply describing the caller's recent activity."""
-    if not DISCORD_TOKEN:
-        raise ApiError("server_missing_discord_token", 503)
+    mention_message_id: str,
+    channel_history: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Return one recent prior message for quick context, if available."""
+    for item in channel_history:
+        if not isinstance(item, dict):
+            continue
+        author = item.get("author") if isinstance(item.get("author"), dict) else {}
+        if str(author.get("id", "")).strip() != user_id:
+            continue
+
+        message_id = str(item.get("id", "")).strip()
+        if not message_id or message_id == mention_message_id:
+            continue
+
+        return {
+            "message_id": message_id,
+            "content": str(item.get("content") or ""),
+            "timestamp": str(item.get("timestamp") or ""),
+        }
+
+    return None
+
+
+def _collect_mention_candidates(
+    channel_id: str,
+    scan_limit: int,
+    lookback_limit: int,
+) -> dict[str, Any]:
+    """Collect mention candidates and reply-eligibility metadata without posting."""
+    recent_for_mentions = _fetch_discord_messages_raw(channel_id, scan_limit)
+    history = _fetch_discord_messages_raw(channel_id, lookback_limit)
+    bot_user_id = _fetch_discord_bot_user_id()
+
+    # Discord returns newest-first; process oldest-first for natural reply order.
+    ordered_messages = list(reversed(recent_for_mentions))
+    candidates: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+
+    for message in ordered_messages:
+        message_id = str(message.get("id", "")).strip()
+        if not message_id:
+            continue
+
+        author = message.get("author") if isinstance(message.get("author"), dict) else {}
+        author_id = str(author.get("id", "")).strip()
+        if not author_id or author_id == bot_user_id:
+            continue
+
+        if not _message_mentions_bot(message, bot_user_id):
+            continue
+
+        already_replied_in_history = _bot_already_replied_to_message(
+            mention_message_id=message_id,
+            bot_user_id=bot_user_id,
+            channel_history=history,
+        )
+        already_replied_recently = _is_mention_replied(message_id)
+
+        reason = None
+        if already_replied_in_history:
+            reason = "already_replied_in_history"
+        elif already_replied_recently:
+            reason = "already_replied_recently"
+
+        if reason:
+            skipped.append({"message_id": message_id, "reason": reason})
+
+        candidates.append(
+            {
+                "message_id": message_id,
+                "user_id": author_id,
+                "mention_content": str(message.get("content") or ""),
+                "timestamp": str(message.get("timestamp") or ""),
+                "author": {
+                    "username": str(author.get("username") or ""),
+                    "global_name": str(author.get("global_name") or ""),
+                    "display_name": str(author.get("display_name") or ""),
+                },
+                "activity_status": _build_user_activity_status(author_id, history),
+                "reply_eligible": not (already_replied_in_history or already_replied_recently),
+                "already_replied_in_history": already_replied_in_history,
+                "already_replied_recently": already_replied_recently,
+            }
+        )
+
+    return {
+        "history": history,
+        "bot_user_id": bot_user_id,
+        "candidates": candidates,
+        "skipped": skipped,
+    }
+
+
+def _build_activity_reply_text(status: dict[str, Any]) -> str:
+    """Build default activity summary text without mention prefix."""
 
     def _plural(value: int, singular: str, plural: str) -> str:
         return singular if value == 1 else plural
@@ -1215,7 +1314,32 @@ def _post_discord_message_reply(
         f"within {_human_duration(window_seconds)}."
     )
 
-    content = f"<@{user_id}> {status_text} {threshold_text}"
+    return f"{status_text} {threshold_text}"
+
+
+def _compose_reply_content(user_id: str, status: dict[str, Any], custom_reply_message: str = "") -> str:
+    """Compose reply content, using caller-authored text when provided."""
+    custom_text = custom_reply_message.strip()
+    if custom_text:
+        if f"<@{user_id}>" in custom_text or f"<@!{user_id}>" in custom_text:
+            return custom_text
+        return f"<@{user_id}> {custom_text}"
+
+    return f"<@{user_id}> {_build_activity_reply_text(status)}"
+
+
+def _post_discord_message_reply(
+    channel_id: str,
+    reference_message_id: str,
+    user_id: str,
+    status: dict[str, Any],
+    custom_reply_message: str = "",
+) -> None:
+    """Post a Discord threaded reply describing the caller's recent activity."""
+    if not DISCORD_TOKEN:
+        raise ApiError("server_missing_discord_token", 503)
+
+    content = _compose_reply_content(user_id, status, custom_reply_message=custom_reply_message)
 
     try:
         response = requests.post(
@@ -1531,7 +1655,7 @@ def discord_commands_sync() -> tuple[Any, int]:
 
 @app.route("/discord/mentions/respond", methods=["GET"])
 def discord_mentions_respond() -> tuple[Any, int]:
-    """Reply to recent bot mentions with a lightweight user activity status."""
+    """Query or reply to recent bot mentions with optional caller-authored text."""
     if not MENTION_REPLY_ENABLED:
         return jsonify({"error": "mention_reply_disabled"}), 503
 
@@ -1577,63 +1701,104 @@ def discord_mentions_respond() -> tuple[Any, int]:
             max_replies = MENTION_REPLY_MAX_RESPONSES_PER_RUN
         max_replies = max(1, min(max_replies, 3))
 
-        recent_for_mentions = _fetch_discord_messages_raw(channel_id, scan_limit)
-        history = _fetch_discord_messages_raw(channel_id, lookback_limit)
-        bot_user_id = _fetch_discord_bot_user_id()
+        mode = request.args.get("mode", "respond").strip().lower()
+        if mode not in {"query", "respond"}:
+            raise ApiError("invalid_mention_mode", 400)
 
-        # Discord returns newest-first; process oldest-first for natural reply order.
-        candidates = list(reversed(recent_for_mentions))
+        reply_message = request.args.get("reply_message", "")
+
+        message_id_tokens: list[str] = []
+        for raw_value in request.args.getlist("message_ids"):
+            for token in raw_value.split(","):
+                candidate = token.strip()
+                if not candidate:
+                    continue
+                if not candidate.isdigit():
+                    raise ApiError("invalid_message_ids", 400)
+                message_id_tokens.append(candidate)
+        target_message_ids = set(message_id_tokens)
+
+        scan_result = _collect_mention_candidates(channel_id, scan_limit, lookback_limit)
+        candidates = scan_result["candidates"]
+        skipped: list[dict[str, Any]] = list(scan_result["skipped"])
+
+        if mode == "query":
+            most_recent_mention: dict[str, Any] | None = None
+            if candidates:
+                newest = candidates[-1]
+                recent_preview = _build_recent_message_preview(
+                    newest["user_id"],
+                    newest["message_id"],
+                    scan_result["history"],
+                )
+                most_recent_mention = {
+                    "message_id": newest["message_id"],
+                    "recent_message_preview": recent_preview,
+                }
+
+            return jsonify(
+                {
+                    "status": "ok",
+                    "mode": "query",
+                    "channel_id": channel_id,
+                    "scan_limit": scan_limit,
+                    "lookback_limit": lookback_limit,
+                    "max_replies": max_replies,
+                    "candidate_count": len(candidates),
+                    "candidates": candidates,
+                    "most_recent_mention": most_recent_mention,
+                    "skipped": skipped,
+                }
+            ), 200
+
         replies: list[dict[str, Any]] = []
-        skipped: list[dict[str, Any]] = []
 
-        for message in candidates:
+        for candidate in candidates:
             if len(replies) >= max_replies:
                 break
 
-            message_id = str(message.get("id", "")).strip()
+            message_id = str(candidate.get("message_id", "")).strip()
             if not message_id:
                 continue
 
-            author = message.get("author") if isinstance(message.get("author"), dict) else {}
-            author_id = str(author.get("id", "")).strip()
-            if not author_id or author_id == bot_user_id:
+            author_id = str(candidate.get("user_id", "")).strip()
+            if not author_id:
                 continue
 
-            if not _message_mentions_bot(message, bot_user_id):
+            if target_message_ids and message_id not in target_message_ids:
                 continue
 
-            if _bot_already_replied_to_message(
-                mention_message_id=message_id,
-                bot_user_id=bot_user_id,
-                channel_history=history,
-            ):
-                skipped.append({"message_id": message_id, "reason": "already_replied_in_history"})
-                _mark_mention_replied(message_id)
+            if not bool(candidate.get("reply_eligible", False)):
                 continue
 
-            if _is_mention_replied(message_id):
-                skipped.append({"message_id": message_id, "reason": "already_replied_recently"})
-                continue
-
-            status = _build_user_activity_status(author_id, history)
-            _post_discord_message_reply(channel_id, message_id, author_id, status)
+            status = candidate.get("activity_status") if isinstance(candidate.get("activity_status"), dict) else {}
+            _post_discord_message_reply(
+                channel_id,
+                message_id,
+                author_id,
+                status,
+                custom_reply_message=reply_message,
+            )
             _mark_mention_replied(message_id)
             replies.append(
                 {
                     "message_id": message_id,
                     "user_id": author_id,
                     "activity_status": status,
+                    "custom_reply_used": bool(reply_message.strip()),
                 }
             )
 
         return jsonify(
             {
                 "status": "ok",
+                "mode": "respond",
                 "channel_id": channel_id,
                 "scan_limit": scan_limit,
                 "lookback_limit": lookback_limit,
                 "max_replies": max_replies,
                 "reply_count": len(replies),
+                "targeted_message_count": len(target_message_ids) if target_message_ids else 0,
                 "replies": replies,
                 "skipped": skipped,
             }
