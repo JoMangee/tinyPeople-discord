@@ -75,6 +75,8 @@ Structured embeds:
 GET /messages?channel_id=CHANNEL_ID&message_id=MESSAGE_ID&tp_embed_mode=structured&tp_key=YOUR_API_KEY
 ```
 
+Repo-local ingest guide: [docs/tinyPeople-discord-channel-ingest-public.md](docs/tinyPeople-discord-channel-ingest-public.md)
+
 API key requests are tenant-scoped. A key can only access channels granted to its tenant.
 
 ## Key Lifecycle API (Tenant Scoped)
