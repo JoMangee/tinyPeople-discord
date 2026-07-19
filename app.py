@@ -39,7 +39,7 @@ except ImportError:
     init_db = None
     AuthContext = None
 
-BOT_VERSION = "0.3.2"
+BOT_VERSION = "0.3.3"
 APP_DIR = os.path.dirname(__file__)
 load_dotenv(os.path.join(APP_DIR, ".env"))
 load_dotenv(os.path.join(APP_DIR, ".deploy-stamp.env"))
@@ -240,6 +240,11 @@ def _error_guidance(error_code: str) -> dict[str, Any] | None:
             "hint": "mode must be either query or respond.",
             "next_step": "Retry with mode=query (read-only) or mode=respond (post replies).",
         }
+    if error_code == "invalid_embed_mode":
+        return {
+            "hint": "embed_mode must be either raw or structured.",
+            "next_step": "Retry with tp_embed_mode=raw (default) or tp_embed_mode=structured.",
+        }
     if error_code == "invalid_message_ids":
         return {
             "hint": "message_ids must be comma-separated numeric Discord message IDs.",
@@ -352,6 +357,21 @@ def _raw_image_mode_requested() -> bool:
 
     mode = request.args.get("image_mode", "").strip().lower()
     return mode == "raw"
+
+
+def _embed_mode_requested() -> str:
+    """Return the requested embed mode."""
+    mode = request.args.get("tp_embed_mode", "").strip().lower()
+    if not mode:
+        mode = request.args.get("embed_mode", "").strip().lower()
+
+    if not mode:
+        return "raw"
+
+    if mode in {"raw", "structured"}:
+        return mode
+
+    raise ApiError("invalid_embed_mode", 400)
 
 
 def _resolve_secret_from_request() -> str:
@@ -737,13 +757,87 @@ def _build_raw_image_payloads(attachments: list[dict[str, Any]]) -> list[dict[st
     return payloads
 
 
+def _normalize_embed(embed: dict[str, Any]) -> dict[str, Any] | None:
+    """Convert a Discord embed into a compact structured shape."""
+    if not isinstance(embed, dict):
+        return None
+
+    structured: dict[str, Any] = {}
+
+    for source_key, target_key in (
+        ("type", "type"),
+        ("title", "title"),
+        ("description", "description"),
+        ("url", "url"),
+        ("timestamp", "timestamp"),
+        ("color", "color"),
+    ):
+        value = embed.get(source_key)
+        if isinstance(value, str):
+            value = value.strip()
+        if value not in (None, ""):
+            structured[target_key] = value
+
+    author = embed.get("author")
+    if isinstance(author, dict):
+        author_name = str(author.get("name") or "").strip()
+        if author_name:
+            structured["author_name"] = author_name
+        author_url = str(author.get("url") or "").strip()
+        if author_url:
+            structured["author_url"] = author_url
+        author_icon_url = str(author.get("icon_url") or "").strip()
+        if author_icon_url:
+            structured["author_icon_url"] = author_icon_url
+
+    footer = embed.get("footer")
+    if isinstance(footer, dict):
+        footer_text = str(footer.get("text") or "").strip()
+        if footer_text:
+            structured["footer_text"] = footer_text
+        footer_icon_url = str(footer.get("icon_url") or "").strip()
+        if footer_icon_url:
+            structured["footer_icon_url"] = footer_icon_url
+
+    for source_key, target_key in (("image", "image_url"), ("thumbnail", "thumbnail_url"), ("video", "video_url")):
+        nested = embed.get(source_key)
+        if isinstance(nested, dict):
+            nested_url = str(nested.get("url") or "").strip()
+            if nested_url:
+                structured[target_key] = nested_url
+
+    raw_fields = embed.get("fields")
+    structured_fields: list[dict[str, Any]] = []
+    if isinstance(raw_fields, list):
+        for field in raw_fields:
+            if not isinstance(field, dict):
+                continue
+            field_name = str(field.get("name") or "").strip()
+            field_value = str(field.get("value") or "").strip()
+            if not field_name and not field_value:
+                continue
+            structured_fields.append(
+                {
+                    "name": field_name,
+                    "value": field_value,
+                    "inline": bool(field.get("inline")),
+                }
+            )
+    if structured_fields:
+        structured["fields"] = structured_fields
+
+    return structured or None
+
+
 def _normalize_message(
-    message: dict[str, Any], *, include_raw_images: bool = False
+    message: dict[str, Any], *, include_raw_images: bool = False, embed_mode: str = "raw"
 ) -> dict[str, Any]:
     """Convert Discord message payload to contract output shape."""
     content = message.get("content", "")
     raw_attachments = message.get("attachments")
     attachments = raw_attachments if isinstance(raw_attachments, list) else []
+    raw_embeds = message.get("embeds")
+    embeds = raw_embeds if isinstance(raw_embeds, list) else []
     attachment_urls = [
         str(item.get("url"))
         for item in attachments
@@ -757,9 +851,26 @@ def _normalize_message(
         and (str(item.get("content_type", "")).startswith("image/") or item.get("width"))
     ]
 
+    embed_summaries = []
+    for embed in embeds:
+        if not isinstance(embed, dict):
+            continue
+        title = str(embed.get("title") or "").strip()
+        description = str(embed.get("description") or "").strip()
+        summary = " - ".join(part for part in (title, description) if part)
+        if summary:
+            embed_summaries.append(summary)
+
     # Preserve signal for non-text entries while keeping the response compact.
-    if not content and attachments:
+    if not content and embed_summaries:
+        content = " | ".join(embed_summaries)
+    elif not content and attachments:
         content = "[attachment]"
+
+    if embed_mode == "structured":
+        normalized_embeds = [item for item in (_normalize_embed(embed) for embed in embeds) if item]
+    else:
+        normalized_embeds = embeds
 
     normalized = {
         "timestamp": message.get("timestamp"),
@@ -768,6 +879,7 @@ def _normalize_message(
         "content": content,
         "attachment_urls": attachment_urls,
         "image_urls": image_urls,
+        "embeds": normalized_embeds,
     }
 
     if include_raw_images:
@@ -777,7 +889,11 @@ def _normalize_message(
 
 
 def _fetch_discord_message_by_id(
-    channel_id: str, message_id: str, *, include_raw_images: bool = False
+    channel_id: str,
+    message_id: str,
+    *,
+    include_raw_images: bool = False,
+    embed_mode: str = "raw",
 ) -> dict[str, Any]:
     """Read one specific message from Discord REST API by message ID."""
     if not DISCORD_TOKEN:
@@ -840,11 +956,19 @@ def _fetch_discord_message_by_id(
             debug={"discord_status": response.status_code, "payload_type": type(response_body_json).__name__},
         )
 
-    return _normalize_message(response_body_json, include_raw_images=include_raw_images)
+    return _normalize_message(
+        response_body_json,
+        include_raw_images=include_raw_images,
+        embed_mode=embed_mode,
+    )
 
 
 def _fetch_discord_messages(
-    channel_id: str, limit: int, *, include_raw_images: bool = False
+    channel_id: str,
+    limit: int,
+    *,
+    include_raw_images: bool = False,
+    embed_mode: str = "raw",
 ) -> list[dict[str, Any]]:
     """Read message history from Discord REST API."""
     if not DISCORD_TOKEN:
@@ -910,7 +1034,10 @@ def _fetch_discord_messages(
             debug={"discord_status": response.status_code, "payload_type": type(data).__name__},
         )
 
-    return [_normalize_message(msg, include_raw_images=include_raw_images) for msg in data]
+    return [
+        _normalize_message(msg, include_raw_images=include_raw_images, embed_mode=embed_mode)
+        for msg in data
+    ]
 
 
 def _fetch_discord_messages_raw(channel_id: str, limit: int) -> list[dict[str, Any]]:
@@ -1924,6 +2051,7 @@ def get_messages() -> tuple[Any, int]:
     start_time = time.time()
     debug_enabled = _debug_requested()
     raw_image_mode = _raw_image_mode_requested()
+    embed_mode = _embed_mode_requested()
     _record_message_request()
 
     auth_context = None
@@ -1989,12 +2117,18 @@ def get_messages() -> tuple[Any, int]:
         if message_id:
             messages = [
                 _fetch_discord_message_by_id(
-                    channel_id, message_id, include_raw_images=raw_image_mode
+                    channel_id,
+                    message_id,
+                    include_raw_images=raw_image_mode,
+                    embed_mode=embed_mode,
                 )
             ]
         else:
             messages = _fetch_discord_messages(
-                channel_id, limit, include_raw_images=raw_image_mode
+                channel_id,
+                limit,
+                include_raw_images=raw_image_mode,
+                embed_mode=embed_mode,
             )
 
         # Audit log
@@ -2044,8 +2178,11 @@ def get_messages() -> tuple[Any, int]:
                 "message_id": request.args.get("message_id", ""),
                 "image_mode": request.args.get("tp_image_mode", "")
                 or request.args.get("image_mode", ""),
+                "embed_mode": request.args.get("tp_embed_mode", "")
+                or request.args.get("embed_mode", ""),
                 "limit": request.args.get("limit", ""),
                 "hint": "For private threads, the bot must be an explicit thread member with Read Message History.",
+                "embed_hint": "Use tp_embed_mode=structured to receive a compact embed projection, or omit it for raw Discord embed JSON.",
             }
             if exc.debug:
                 payload["debug"].update(exc.debug)
@@ -2060,9 +2197,11 @@ def get_messages() -> tuple[Any, int]:
                         "channel_id": channel_id,
                         "message_id": message_id,
                         "image_mode": "raw" if raw_image_mode else "off",
+                        "embed_mode": embed_mode,
                         "limit": limit,
                         "returned_count": len(messages),
                         "hint": "If returned_count is 0 for a private thread, add the bot as a thread member and grant Read Message History.",
+                        "embed_hint": "Use tp_embed_mode=structured for limited agents, or leave it blank for raw embeds.",
                     },
                 }
             ),
