@@ -1,6 +1,6 @@
 # tinyPeople Discord Messages API
 
-**Version 0.3.2** — see [CHANGELOG.md](CHANGELOG.md) for history.
+**Version 0.3.3** — see [CHANGELOG.md](CHANGELOG.md) for history.
 
 A Flask API that reads Discord channel messages via a bot token kept server-side.
 
@@ -60,7 +60,20 @@ Optional query params:
 - limit (default from env)
 - message_id (exact message fetch)
 - tp_image_mode=raw (include base64 image chunks)
+- tp_embed_mode=raw|structured (raw Discord embeds by default; structured is a compact projection for limited agents)
 - tp_debug=1 (when ALLOW_DEBUG_QUERY_PARAM=1)
+
+The response keeps Discord embeds in an `embeds` field. Use `tp_embed_mode=structured` for a compact embed projection; leave it unset to receive raw Discord embed JSON. When a message has no plain text content, the API falls back to a compact text summary built from embed title/description so embed-only announcements are still readable.
+
+Small example:
+
+```text
+Raw embeds:
+GET /messages?channel_id=CHANNEL_ID&message_id=MESSAGE_ID&tp_key=YOUR_API_KEY
+
+Structured embeds:
+GET /messages?channel_id=CHANNEL_ID&message_id=MESSAGE_ID&tp_embed_mode=structured&tp_key=YOUR_API_KEY
+```
 
 API key requests are tenant-scoped. A key can only access channels granted to its tenant.
 

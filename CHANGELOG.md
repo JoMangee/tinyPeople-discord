@@ -1,5 +1,13 @@
 # Changelog
 
+# Changelog
+
+## 0.3.3 — 2026-07-19
+
+### Changed
+- `/messages` now preserves Discord embeds and supports `tp_embed_mode=raw|structured`.
+- Debug responses for `/messages?tp_debug=1` include `embed_mode` and an embed usage hint.
+
 ## 0.3.2 — 2026-04-11
 
 ### Added
