@@ -2,7 +2,7 @@
 
 ## Overview
 
-How to use tinyPeople to authenticate, grant channel access, and ingest messages from Discord channels. This is the core workflow for asking tinyNature to check a Discord link and summarise what is happening inside.
+How to use the tinyPeople discord bot to authenticate, grant channel access, and ingest messages from Discord channels. This is the core (non official) workflow for asking tinyNature to check a Discord link and summarise what is happening inside.
 
 ## Base URL
 
