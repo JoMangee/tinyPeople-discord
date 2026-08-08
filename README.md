@@ -20,6 +20,8 @@ Try it now: ask your tinyNature for a pairing link and you're good to go.
 - GET /health
 - GET /discord/mentions/respond
 - GET /oauth/authorize
+- GET /oauth/link
+- GET /oauth/status
 - GET /oauth/callback
 - GET /oauth/key
 - GET /keys
@@ -52,8 +54,15 @@ GET /messages accepts either:
 
 - channel_id (required if discord_url absent)
 - discord_url in Discord copy-link format:
-  https://discord.com/channels/GUILD_ID/CHANNEL_ID
-  https://discord.com/channels/GUILD_ID/CHANNEL_ID/MESSAGE_ID
+
+```text
+https://discord.com/channels/GUILD_ID/CHANNEL_ID
+https://discord.com/channels/GUILD_ID/CHANNEL_ID/MESSAGE_ID
+https://discord.com/channels/@me/CHANNEL_ID
+https://discord.com/channels/@me/CHANNEL_ID/MESSAGE_ID
+```
+
+`@me` URLs are only valid for one-to-one DMs with the bot. They require a tenant API key that is bound to the Discord user who owns that DM, and they will not allow admins or other tenants to read someone else's bot DMs.
 
 Optional query params:
 
@@ -73,6 +82,9 @@ GET /messages?channel_id=CHANNEL_ID&message_id=MESSAGE_ID&tp_key=YOUR_API_KEY
 
 Structured embeds:
 GET /messages?channel_id=CHANNEL_ID&message_id=MESSAGE_ID&tp_embed_mode=structured&tp_key=YOUR_API_KEY
+
+One-to-one bot DM by Discord URL:
+GET /messages?discord_url=https://discord.com/channels/@me/CHANNEL_ID/MESSAGE_ID&tp_key=YOUR_API_KEY
 ```
 
 Repo-local ingest guide: [docs/tinyPeople-discord-channel-ingest-public.md](docs/tinyPeople-discord-channel-ingest-public.md)
@@ -100,15 +112,28 @@ All key lifecycle routes require a valid tenant API key in tp_key (or X-TinyPeop
 Enable with TP_OAUTH_ENABLED=1 and Discord OAuth settings in .env.
 
 1. User starts install:
-  GET /oauth/authorize
+  `GET /oauth/authorize`
+  Agent/chat shortcut (auto-generates pairing_id and returns JSON links): `GET /oauth/link`
+  Optional context (for message handoff tooling): `GET /oauth/link?discord_url=https://discord.com/channels/@me/CHANNEL_ID/MESSAGE_ID`
 
 2. Discord redirects back:
-  GET /oauth/callback
+  `GET /oauth/callback`
 
-3. Retrieve key once:
-  GET /oauth/key?token=SHOW_ONCE_TOKEN
+3. Agent polls pairing status:
+  `GET /oauth/status?pairing_id=PAIRING_ID`
+
+4. Agent retrieves key once when status is ready_to_claim:
+  `GET /oauth/claim?pairing_id=PAIRING_ID`
+
+Manual fallback:
+  `GET /oauth/key?token=SHOW_ONCE_TOKEN`
 
 The raw API key is only retrievable once and is not stored in plaintext.
+
+Discord UI hook:
+
+- Register slash commands with `GET /discord/commands/sync`.
+- Use `/connect` inside Discord to generate an ephemeral authorize/status/claim flow message.
 
 ## Health and Telemetry
 
@@ -285,8 +310,26 @@ https://YOUR_DOMAIN/channels/list?tp_key=YOUR_API_KEY
 
 - Terms of Service URL: https://YOUR_DOMAIN/terms
 - Privacy Policy URL: https://YOUR_DOMAIN/privacy
-- Interactions Endpoint URL: leave blank unless implementing interaction webhooks
+- Interactions Endpoint URL: https://YOUR_DOMAIN/discord/interactions
 - Linked Roles Verification URL: leave blank unless implementing linked roles verification
+
+If you enable Discord slash commands for this app, keep the Interactions Endpoint URL pointed at `/discord/interactions`, set `DISCORD_APP_PUBLIC_KEY` from Developer Portal > General Information, and register commands with `/discord/commands/sync` after deploy.
+
+Operator checklist for interactions:
+
+1. Set `DISCORD_APP_PUBLIC_KEY` from Discord Developer Portal > General Information.
+2. Deploy with `DISCORD_INTERACTIONS_ENABLED=1`.
+3. Set Interactions Endpoint URL to `https://YOUR_DOMAIN/discord/interactions` and save.
+4. Verify runtime wiring with `GET /discord/interactions/health`.
+5. Register slash commands with `GET /discord/commands/sync` using operator digest auth.
+6. If Discord still fails verification or command delivery, inspect the last probe with `GET /discord/interactions/last` using operator digest auth.
+
+Channel access troubleshooting:
+
+- `/channels/grant` only grants tenant-side allowlisting inside this API. It does not change Discord permissions.
+- `discord_channel_not_found` usually means the bot cannot see that guild channel or thread, or the channel ID is not a guild channel for this bot.
+- Private threads require the bot to be an explicit thread member in addition to normal channel visibility.
+- This API is guild-scoped. It does not support reading arbitrary user DM history, and there is no Discord permission toggle or repo command that grants that capability.
 
 ## Environment
 
@@ -300,9 +343,13 @@ Start from .env.example and set production values for:
 - DISCORD_CLIENT_ID
 - DISCORD_CLIENT_SECRET
 - DISCORD_OAUTH_REDIRECT_URI
+- DISCORD_APP_PUBLIC_KEY
+- DISCORD_INTERACTIONS_ENABLED
 - TP_SERVICE_NAME
 - TP_BASE_URL
 - TP_CONTACT_EMAIL
+
+Keep real values in local environment files only. Do not commit production hostnames, OAuth secrets, public keys, API keys, or deploy-specific overrides.
 
 ## Local Run
 

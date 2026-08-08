@@ -6,7 +6,9 @@ How to use the tinyPeople discord bot to authenticate, grant channel access, and
 
 ## Base URL
 
+```text
 https://tinypeople.mesh.net.nz
+```
 
 ## Authentication
 
@@ -14,20 +16,33 @@ All authenticated requests use `tp_key` unless you are using legacy shared-secre
 
 Recommended path:
 
-1. Start a Magic Link pairing with `/oauth/authorize?pairing_id=...`
+1. Start a Magic Link pairing with `/oauth/link` (auto-generated pairing_id) or `/oauth/authorize?pairing_id=...`
 2. Send the returned `authorize_url` to the user
-3. After the user authorizes, claim the key with `/oauth/claim?pairing_id=...`
-4. Use the returned `api_key` as `tp_key`
+3. Poll `/oauth/status?pairing_id=...` until status is `ready_to_claim`
+4. Claim the key with `/oauth/claim?pairing_id=...`
+5. Use the returned `api_key` as `tp_key`
+
+Discord UI shortcut:
+
+- After running `/discord/commands/sync`, users can run `/connect` in Discord to receive an ephemeral authorize link plus status/claim URLs.
 
 ## Quick Start
 
 ### 1. Pairing
+
+GET /oauth/link
+
+Or explicit pairing ID:
 
 GET /oauth/authorize?pairing_id=tp-pair-example-001
 
 ### 2. Claim
 
 GET /oauth/claim?pairing_id=tp-pair-example-001
+
+Optional polling status:
+
+GET /oauth/status?pairing_id=tp-pair-example-001
 
 ### 3. Health check
 
@@ -46,6 +61,8 @@ GET /messages?channel_id=CHANNEL_ID&limit=50&tp_key=YOUR_KEY
 Or use a Discord URL:
 
 GET /messages?discord_url=ENCODED_DISCORD_URL&limit=50&tp_key=YOUR_KEY
+
+One-to-one bot DMs are also supported with Discord `@me` links, but only when the API key is bound to the Discord user who owns that DM. This prevents other tenants or operators from using a different key to read someone else's bot DM history.
 
 ### 6. Fetch a specific message
 

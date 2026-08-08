@@ -129,7 +129,10 @@ TP_ENABLE_API_KEYS = (
 DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID", "").strip()
 DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "").strip()
 DISCORD_OAUTH_REDIRECT_URI = os.getenv("DISCORD_OAUTH_REDIRECT_URI", "").strip()
-DISCORD_APP_PUBLIC_KEY = os.getenv("DISCORD_APP_PUBLIC_KEY", "").strip().lower()
+DISCORD_APP_PUBLIC_KEY = (
+    os.getenv("DISCORD_APP_PUBLIC_KEY", "")
+    or os.getenv("DISCORD_PUBLIC_KEY", "")
+).strip().lower()
 DISCORD_INTERACTIONS_ENABLED = (
     os.getenv("DISCORD_INTERACTIONS_ENABLED", "1").strip().lower()
     in {"1", "true", "yes", "on"}
@@ -167,6 +170,9 @@ _SHOW_ONCE: dict[str, dict] = {}
 # Pairing index for agent-driven Magic Link flow.
 # Maps pairing_id -> show_token so /oauth/claim can look up by pairing_id.
 _PAIRING_INDEX: dict[str, str] = {}
+# Claimed pairing IDs retained briefly for explicit status checks.
+# Maps pairing_id -> claimed_at_unix_seconds.
+_CLAIMED_PAIRINGS: dict[str, int] = {}
 _LAST_DISCORD_INTERACTION: dict[str, Any] = {}
 _LAST_DISCORD_INTERACTION_LOCK = Lock()
 RECENT_NONCES: dict[str, int] = {}
@@ -213,7 +219,27 @@ def _error_guidance(error_code: str) -> dict[str, Any] | None:
     if error_code == "invalid_discord_url":
         return {
             "hint": "discord_url must be a Discord channel/message link.",
-            "next_step": "Use: https://discord.com/channels/GUILD_ID/CHANNEL_ID[/MESSAGE_ID]",
+            "next_step": "Use: https://discord.com/channels/GUILD_ID/CHANNEL_ID[/MESSAGE_ID] or https://discord.com/channels/@me/CHANNEL_ID[/MESSAGE_ID]",
+        }
+    if error_code == "dm_url_requires_api_key":
+        return {
+            "hint": "One-to-one DM access requires a tenant API key that is bound to a Discord user.",
+            "next_step": "Retry the @me Discord URL with tp_key from /oauth/authorize or a key issued from that bound key.",
+        }
+    if error_code == "dm_url_requires_bound_api_key":
+        return {
+            "hint": "This API key is not bound to a Discord user, so DM ownership cannot be verified.",
+            "next_step": "Mint a fresh key via /oauth/authorize or rotate from an already bound key, then retry the @me Discord URL.",
+        }
+    if error_code == "dm_url_not_one_to_one":
+        return {
+            "hint": "The supplied @me URL is not a one-to-one direct message channel.",
+            "next_step": "Use a direct-message URL where the bot and exactly one Discord user are the participants.",
+        }
+    if error_code == "dm_url_not_owned_by_key":
+        return {
+            "hint": "This DM channel is not owned by the Discord user bound to the supplied API key.",
+            "next_step": "Use the API key minted for the DM participant, not another tenant key or operator credential.",
         }
     if error_code.startswith("limit_out_of_range") or error_code == "invalid_limit":
         return {
@@ -259,6 +285,18 @@ def _error_guidance(error_code: str) -> dict[str, Any] | None:
         return {
             "hint": "This key is valid, but the requested channel is not granted for this tenant.",
             "next_step": "Grant access with /channels/grant?channel_id=... (or add channel to TP_PUBLIC_CHANNEL_IDS).",
+        }
+    if error_code == "discord_channel_not_found":
+        return {
+            "hint": (
+                "Discord could not resolve this channel for the bot. The target must be a guild "
+                "channel or thread the bot can view. Tenant channel grants do not create Discord-side access."
+            ),
+            "next_step": (
+                "Verify the channel is in a server where the bot is installed, the bot has View Channel "
+                "+ Read Message History, and for private threads the bot is an explicit thread member. "
+                "Arbitrary user DM history is not supported by this guild-scoped API."
+            ),
         }
     return None
 
@@ -318,20 +356,42 @@ def _debug_requested() -> bool:
 _DISCORD_CHANNEL_URL_RE = re.compile(
     r"https?://(?:www\.)?discord\.com/channels/(?P<guild>\d+)/(?P<channel>\d+)(?:/(?P<message>\d+))?"
 )
+_DISCORD_DM_URL_RE = re.compile(
+    r"https?://(?:www\.)?discord\.com/channels/@me/(?P<channel>\d+)(?:/(?P<message>\d+))?"
+)
 
 
-def _parse_discord_url(url: str) -> tuple[str, str, str | None] | None:
-    """Parse a Discord channel/message URL into (guild_id, channel_id, message_id|None).
+def _parse_discord_url(url: str) -> dict[str, str | None] | None:
+    """Parse a Discord channel/message URL into a normalized descriptor.
     
     Accepts:
       https://discord.com/channels/GUILD/CHANNEL
       https://discord.com/channels/GUILD/CHANNEL/MESSAGE
+      https://discord.com/channels/@me/CHANNEL
+      https://discord.com/channels/@me/CHANNEL/MESSAGE
     Returns None if the URL doesn't match.
     """
-    m = _DISCORD_CHANNEL_URL_RE.match(url.strip())
-    if not m:
+    normalized_url = url.strip()
+
+    dm_match = _DISCORD_DM_URL_RE.match(normalized_url)
+    if dm_match:
+        return {
+            "scope": "dm",
+            "guild_id": None,
+            "channel_id": dm_match.group("channel"),
+            "message_id": dm_match.group("message"),
+        }
+
+    guild_match = _DISCORD_CHANNEL_URL_RE.match(normalized_url)
+    if not guild_match:
         return None
-    return m.group("guild"), m.group("channel"), m.group("message")
+
+    return {
+        "scope": "guild",
+        "guild_id": guild_match.group("guild"),
+        "channel_id": guild_match.group("channel"),
+        "message_id": guild_match.group("message"),
+    }
 
 
 def _build_oauth_install_url() -> str | None:
@@ -886,6 +946,67 @@ def _normalize_message(
         normalized["raw_images"] = _build_raw_image_payloads(attachments)
 
     return normalized
+
+
+def _fetch_discord_channel(channel_id: str) -> dict[str, Any]:
+    """Read one Discord channel object to validate DM ownership and channel scope."""
+    if not DISCORD_TOKEN:
+        raise ApiError("server_missing_discord_token", 503)
+
+    try:
+        response = requests.get(
+            f"https://discord.com/api/v10/channels/{channel_id}",
+            headers={
+                "Authorization": f"Bot {DISCORD_TOKEN}",
+                "User-Agent": "tinyPeople-messages-api/0.1.0",
+            },
+            timeout=DISCORD_HTTP_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException as exc:
+        raise ApiError(
+            "discord_upstream_unreachable",
+            502,
+            debug={"upstream": "discord", "exception": type(exc).__name__},
+        ) from exc
+
+    response_body_json: Any | None = None
+    try:
+        response_body_json = response.json()
+    except ValueError:
+        response_body_json = None
+
+    if response.status_code == 401:
+        raise ApiError("discord_token_rejected", 502, debug={"discord_status": 401})
+    if response.status_code == 403:
+        debug = {"discord_status": 403}
+        if isinstance(response_body_json, dict):
+            debug["discord_code"] = response_body_json.get("code")
+            debug["discord_message"] = response_body_json.get("message")
+        raise ApiError("discord_forbidden_channel", 403, debug=debug)
+    if response.status_code == 404:
+        debug = {"discord_status": 404}
+        if isinstance(response_body_json, dict):
+            debug["discord_code"] = response_body_json.get("code")
+            debug["discord_message"] = response_body_json.get("message")
+        raise ApiError("discord_channel_not_found", 404, debug=debug)
+    if response.status_code >= 400:
+        debug = {"discord_status": response.status_code}
+        if isinstance(response_body_json, dict):
+            debug["discord_code"] = response_body_json.get("code")
+            debug["discord_message"] = response_body_json.get("message")
+        raise ApiError("discord_upstream_error", 502, debug=debug)
+
+    if not isinstance(response_body_json, dict):
+        raise ApiError(
+            "discord_unexpected_payload",
+            502,
+            debug={
+                "discord_status": response.status_code,
+                "payload_type": type(response_body_json).__name__,
+            },
+        )
+
+    return response_body_json
 
 
 def _fetch_discord_message_by_id(
@@ -1564,10 +1685,14 @@ def _build_help_text(base_url: str) -> str:
             "Magic Link flow:",
             "1) Agent generates a random pairing_id (example shown) and starts pairing:",
             f"{base_url}/oauth/authorize?pairing_id={sample_pairing}",
+            "   Shortcut: auto-generate a pairing link in one call:",
+            f"{base_url}/oauth/link?discord_url={sample_url}",
             "2) User opens authorize_url from response and approves OAuth in Discord.",
-            "3) Agent claims key using the same pairing_id (no tp_digest or tp_key required):",
+            "3) Agent polls status until key is ready:",
+            f"{base_url}/oauth/status?pairing_id={sample_pairing}",
+            "4) Agent claims key using the same pairing_id (no tp_digest or tp_key required):",
             f"{base_url}/oauth/claim?pairing_id={sample_pairing}",
-            "4) Claim response returns api_key. Use that value as tp_key on /messages and channel-policy routes.",
+            "5) Claim response returns api_key. Use that value as tp_key on /messages and channel-policy routes.",
             "",
             "Optional tenant channel policy endpoints (after claim, use tp_key):",
             f"{base_url}/channels/list?tp_key=YOUR_KEY",
@@ -1586,6 +1711,248 @@ def _build_help_text(base_url: str) -> str:
     )
 
     return text
+
+
+def _pairing_id_valid(pairing_id: str) -> bool:
+    """Validate pairing ID format for OAuth pairing flow."""
+    return bool(
+        pairing_id
+        and len(pairing_id) <= 128
+        and re.fullmatch(r"[A-Za-z0-9_\-]+", pairing_id)
+    )
+
+
+def _start_oauth_pairing(
+    pairing_id: str,
+    *,
+    context_discord_url: str = "",
+) -> dict[str, Any]:
+    """Create OAuth state and return ready-to-share authorize/claim links."""
+    db = get_db()
+    state = secrets.token_urlsafe(32)
+    db.store_oauth_state(
+        state,
+        ttl_seconds=TP_OAUTH_STATE_TTL_SECONDS,
+        pairing_id=pairing_id,
+    )
+
+    authorize_url = (
+        f"https://discord.com/oauth2/authorize"
+        f"?client_id={DISCORD_CLIENT_ID}"
+        f"&permissions={DISCORD_BOT_PERMISSIONS}"
+        f"&redirect_uri={DISCORD_OAUTH_REDIRECT_URI}"
+        f"&response_type=code"
+        f"&scope=bot+identify"
+        f"&state={state}"
+    )
+
+    base_url = TP_BASE_URL or request.url_root.rstrip("/")
+    status_url = f"{base_url}/oauth/status?pairing_id={pairing_id}"
+    claim_url = f"{base_url}/oauth/claim?pairing_id={pairing_id}"
+    payload: dict[str, Any] = {
+        "status": "pairing_initiated",
+        "pairing_id": pairing_id,
+        "authorize_url": authorize_url,
+        "claim_url": claim_url,
+        "status_url": status_url,
+        "agent_commands": {
+            "create": f"GET {base_url}/oauth/link?pairing_id={pairing_id}",
+            "status": f"GET {status_url}",
+            "claim": f"GET {claim_url}",
+        },
+        "flow": {
+            "current_step": "await_user_authorization",
+            "user_action_required": True,
+            "instructions_for_user": [
+                "Open authorize_url and approve the bot in Discord.",
+                "Return to your agent after approval; no key copy/paste is required.",
+            ],
+            "instructions_for_agent": [
+                "Send authorize_url to the user in chat.",
+                "Poll status_url until status=ready_to_claim.",
+                "Then call claim_url once to retrieve api_key.",
+                "Store api_key securely and use it as tp_key in subsequent requests.",
+            ],
+            "poll": {
+                "interval_seconds": 3,
+                "status_url": status_url,
+            },
+        },
+        "hint": (
+            "Have the user open authorize_url and approve the bot. "
+            "Then poll status_url and call claim_url to retrieve the key. "
+            f"The claim window is {TP_OAUTH_SHOW_ONCE_TTL_SECONDS}s after the user authorizes."
+        ),
+    }
+
+    raw_context = context_discord_url.strip()
+    if raw_context:
+        payload["context_discord_url"] = raw_context
+        parsed = _parse_discord_url(raw_context)
+        if parsed:
+            payload["context"] = {
+                "scope": parsed.get("scope"),
+                "channel_id": parsed.get("channel_id"),
+                "message_id": parsed.get("message_id"),
+            }
+
+    return payload
+
+
+def _prune_oauth_pairing_runtime_state(now: int | None = None) -> None:
+    """Prune expired pairing and show-once runtime state."""
+    current = int(time.time()) if now is None else now
+
+    expired_show_tokens = [k for k, v in _SHOW_ONCE.items() if v["expires_at"] <= current]
+    for token in expired_show_tokens:
+        expired_entry = _SHOW_ONCE.pop(token, None)
+        if expired_entry and expired_entry.get("pairing_id"):
+            _PAIRING_INDEX.pop(expired_entry["pairing_id"], None)
+
+    claimed_cutoff = current - (TP_OAUTH_SHOW_ONCE_TTL_SECONDS * 2)
+    stale_claims = [pairing_id for pairing_id, ts in _CLAIMED_PAIRINGS.items() if ts < claimed_cutoff]
+    for pairing_id in stale_claims:
+        _CLAIMED_PAIRINGS.pop(pairing_id, None)
+
+
+def _build_oauth_status_payload(pairing_id: str) -> dict[str, Any]:
+    """Build machine-friendly status payload for pairing progress checks."""
+    now = int(time.time())
+    _prune_oauth_pairing_runtime_state(now)
+
+    base_url = TP_BASE_URL or request.url_root.rstrip("/")
+    claim_url = f"{base_url}/oauth/claim?pairing_id={pairing_id}"
+    status_url = f"{base_url}/oauth/status?pairing_id={pairing_id}"
+
+    show_token = _PAIRING_INDEX.get(pairing_id)
+    if show_token and show_token in _SHOW_ONCE:
+        entry = _SHOW_ONCE[show_token]
+        return {
+            "status": "ready_to_claim",
+            "pairing_id": pairing_id,
+            "status_url": status_url,
+            "claim_url": claim_url,
+            "expires_at": entry.get("expires_at"),
+            "seconds_until_expiry": max(0, int(entry.get("expires_at", now) - now)),
+            "flow": {
+                "current_step": "claim_key",
+                "user_action_required": False,
+                "instructions_for_agent": [
+                    "Call claim_url now to retrieve api_key.",
+                    "Store api_key securely; it is returned once.",
+                ],
+            },
+        }
+
+    if pairing_id in _CLAIMED_PAIRINGS:
+        return {
+            "status": "claimed",
+            "pairing_id": pairing_id,
+            "status_url": status_url,
+            "flow": {
+                "current_step": "done",
+                "user_action_required": False,
+                "instructions_for_agent": [
+                    "This pairing was already claimed.",
+                    "Start a new pairing if another key is needed.",
+                ],
+            },
+        }
+
+    db = get_db()
+    state_info = db.get_oauth_pairing_state(pairing_id)
+    if state_info:
+        expires_at = int(state_info.get("expires_at") or now)
+        return {
+            "status": "awaiting_user_authorization",
+            "pairing_id": pairing_id,
+            "status_url": status_url,
+            "claim_url": claim_url,
+            "state_expires_at": expires_at,
+            "state_seconds_until_expiry": max(0, expires_at - now),
+            "flow": {
+                "current_step": "await_user_authorization",
+                "user_action_required": True,
+                "instructions_for_user": [
+                    "Open authorize_url from /oauth/link or /oauth/authorize response.",
+                    "Approve the bot in Discord.",
+                ],
+                "instructions_for_agent": [
+                    "Keep polling status_url every few seconds.",
+                    "When status changes to ready_to_claim, call claim_url.",
+                ],
+                "poll": {
+                    "interval_seconds": 3,
+                    "status_url": status_url,
+                },
+            },
+        }
+
+    return {
+        "status": "expired_or_unknown",
+        "pairing_id": pairing_id,
+        "status_url": status_url,
+        "flow": {
+            "current_step": "restart_pairing",
+            "user_action_required": True,
+            "instructions_for_agent": [
+                "Start a new pairing via /oauth/link or /oauth/authorize?pairing_id=NEW_ID.",
+            ],
+        },
+    }
+
+
+@app.route("/oauth/link")
+def oauth_link() -> tuple[Any, int]:
+    """Return bot-friendly OAuth links as JSON for chat and agent workflows."""
+    if not TP_OAUTH_ENABLED:
+        oauth_url = _build_oauth_install_url()
+        return jsonify(
+            {
+                "error": "oauth_not_enabled",
+                "hint": "Set TP_OAUTH_ENABLED=1 and configure DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET, DISCORD_OAUTH_REDIRECT_URI in .env",
+                "install_url": oauth_url,
+            }
+        ), 503
+
+    if not (DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET and DISCORD_OAUTH_REDIRECT_URI):
+        return jsonify({"error": "oauth_not_configured"}), 503
+
+    pairing_id = request.args.get("pairing_id", "").strip()
+    if not pairing_id:
+        pairing_id = f"tp-pair-{secrets.token_urlsafe(12)}"
+    if not _pairing_id_valid(pairing_id):
+        return jsonify(
+            {
+                "error": "invalid_pairing_id",
+                "hint": "pairing_id must be URL-safe alphanumeric, dash, or underscore — max 128 chars.",
+            }
+        ), 400
+
+    context_discord_url = request.args.get("discord_url", "")
+    payload = _start_oauth_pairing(
+        pairing_id,
+        context_discord_url=context_discord_url,
+    )
+    return jsonify(payload), 200
+
+
+@app.route("/oauth/status")
+def oauth_status() -> tuple[Any, int]:
+    """Return machine-friendly pairing status for server-side polling workflows."""
+    pairing_id = request.args.get("pairing_id", "").strip()
+    if not pairing_id:
+        return jsonify({"error": "missing_pairing_id"}), 400
+    if not _pairing_id_valid(pairing_id):
+        return jsonify(
+            {
+                "error": "invalid_pairing_id",
+                "hint": "pairing_id must be URL-safe alphanumeric, dash, or underscore — max 128 chars.",
+            }
+        ), 400
+
+    payload = _build_oauth_status_payload(pairing_id)
+    return jsonify(payload), 200
 
 
 def _discord_signature_is_valid(raw_body: bytes) -> bool:
@@ -1690,6 +2057,34 @@ def discord_interactions() -> tuple[Any, int]:
                 )
             return jsonify({"type": 4, "data": {"content": content}}), 200
 
+        if command == "connect":
+            # Create a pairing that can be completed without copy/paste key handling.
+            interaction_user = payload.get("member") or payload.get("user") or {}
+            if isinstance(interaction_user, dict) and isinstance(interaction_user.get("user"), dict):
+                interaction_user = interaction_user.get("user") or {}
+            discord_user_id = str((interaction_user or {}).get("id") or "").strip()
+            random_tail = secrets.token_urlsafe(8)
+            if discord_user_id:
+                pairing_id = f"tp-dc-{discord_user_id[-6:]}-{random_tail}"
+            else:
+                pairing_id = f"tp-dc-{random_tail}"
+
+            pairing_payload = _start_oauth_pairing(pairing_id)
+            authorize_url = str(pairing_payload.get("authorize_url") or "")
+            status_url = str(pairing_payload.get("status_url") or "")
+            claim_url = str(pairing_payload.get("claim_url") or "")
+
+            content = "\n".join(
+                [
+                    "Connect tinyPeople in 3 steps:",
+                    f"1) Open this link and approve: {authorize_url}",
+                    f"2) Poll status: {status_url}",
+                    f"3) Claim key when ready: {claim_url}",
+                    "No key copy/paste by the user is required.",
+                ]
+            )
+            return jsonify({"type": 4, "data": {"content": content, "flags": 64}}), 200
+
         return jsonify({"type": 4, "data": {"content": "Unknown command."}}), 200
 
     return jsonify({"error": "unsupported_interaction_type"}), 400
@@ -1742,6 +2137,10 @@ def discord_commands_sync() -> tuple[Any, int]:
         {
             "name": "help",
             "description": "Show tinyPeople API help links",
+        },
+        {
+            "name": "connect",
+            "description": "Generate a one-click OAuth connect flow",
         }
     ]
 
@@ -2046,7 +2445,9 @@ def get_messages() -> tuple[Any, int]:
     
     Accepts channel_id + optional message_id, OR a raw discord_url:
       ?discord_url=https://discord.com/channels/GUILD/CHANNEL/MESSAGE
-    When discord_url is provided, guild is validated against tenant ownership.
+            ?discord_url=https://discord.com/channels/@me/CHANNEL/MESSAGE
+        When discord_url is provided, guild URLs are validated against tenant ownership.
+        One-to-one DM URLs are bound to the Discord user associated with the API key.
     """
     start_time = time.time()
     debug_enabled = _debug_requested()
@@ -2056,6 +2457,7 @@ def get_messages() -> tuple[Any, int]:
 
     auth_context = None
     channel_id = None
+    discord_url_scope = "guild"
 
     try:
         # Resolve API key / tenant auth context (new)
@@ -2067,9 +2469,37 @@ def get_messages() -> tuple[Any, int]:
             parsed = _parse_discord_url(discord_url)
             if not parsed:
                 raise ApiError("invalid_discord_url", 400)
-            url_guild_id, url_channel_id, url_message_id = parsed
-            # If using a tenant key, ensure guild matches
-            if auth_context and auth_context.tenant_id:
+            discord_url_scope = str(parsed.get("scope") or "guild")
+            url_channel_id = str(parsed.get("channel_id") or "")
+            url_message_id = parsed.get("message_id")
+            if discord_url_scope == "dm":
+                if not (auth_context and is_key_based and auth_context.key_id and get_db):
+                    raise ApiError("dm_url_requires_api_key", 403)
+                db = get_db()
+                key_info = db.get_api_key(auth_context.key_id)
+                owner_user_id = str((key_info or {}).get("owner_user_id") or "").strip()
+                if not owner_user_id:
+                    raise ApiError("dm_url_requires_bound_api_key", 403)
+                dm_channel = _fetch_discord_channel(url_channel_id)
+                if int(dm_channel.get("type", -1)) != 1:
+                    raise ApiError("dm_url_not_one_to_one", 403)
+                recipients = dm_channel.get("recipients")
+                recipient_ids = {
+                    str(item.get("id", "")).strip()
+                    for item in recipients
+                    if isinstance(recipients, list) and isinstance(item, dict)
+                }
+                if owner_user_id not in recipient_ids:
+                    raise ApiError(
+                        "dm_url_not_owned_by_key",
+                        403,
+                        debug={
+                            "recipient_count": len(recipient_ids),
+                            "key_owner_user_id": owner_user_id,
+                        },
+                    )
+            elif auth_context and auth_context.tenant_id:
+                url_guild_id = str(parsed.get("guild_id") or "")
                 db = get_db()
                 tenant = db.get_tenant_by_guild(url_guild_id)
                 if not tenant or tenant["tenant_id"] != auth_context.tenant_id:
@@ -2095,7 +2525,7 @@ def get_messages() -> tuple[Any, int]:
             _authorize_request(channel_id, limit)
 
         # Tenant-scoped channel access
-        if auth_context and auth_context.tenant_id and get_db:
+        if auth_context and auth_context.tenant_id and get_db and discord_url_scope != "dm":
             db = get_db()
             if (
                 channel_id not in TP_PUBLIC_CHANNEL_IDS
@@ -2312,21 +2742,23 @@ def oauth_authorize() -> tuple[Any, int]:
     # Optional agent-driven pairing: caller provides a stable pairing_id they will
     # use later to claim the key via /oauth/claim (no copy-paste needed).
     pairing_id = request.args.get("pairing_id", "").strip() or None
-    if pairing_id and (
-        len(pairing_id) > 128
-        or not re.fullmatch(r"[A-Za-z0-9_\-]+", pairing_id)
-    ):
+    if pairing_id and not _pairing_id_valid(pairing_id):
         return jsonify({
             "error": "invalid_pairing_id",
             "hint": "pairing_id must be URL-safe alphanumeric, dash, or underscore — max 128 chars.",
         }), 400
+
+    if pairing_id:
+        # Agent-driven pairing: return JSON so the agent can hand the URL to the user.
+        payload = _start_oauth_pairing(pairing_id)
+        return jsonify(payload), 200
 
     db = get_db()
     state = secrets.token_urlsafe(32)
     db.store_oauth_state(
         state,
         ttl_seconds=TP_OAUTH_STATE_TTL_SECONDS,
-        pairing_id=pairing_id,
+        pairing_id=None,
     )
 
     redirect_url = (
@@ -2338,20 +2770,6 @@ def oauth_authorize() -> tuple[Any, int]:
         f"&scope=bot+identify"
         f"&state={state}"
     )
-
-    if pairing_id:
-        # Agent-driven pairing: return JSON so the agent can hand the URL to the user.
-        return jsonify({
-            "status": "pairing_initiated",
-            "pairing_id": pairing_id,
-            "authorize_url": redirect_url,
-            "claim_url": f"{TP_BASE_URL}/oauth/claim?pairing_id={pairing_id}",
-            "hint": (
-                f"Have the user open authorize_url and approve the bot. "
-                f"Then call claim_url to retrieve the key. "
-                f"The claim window is {TP_OAUTH_SHOW_ONCE_TTL_SECONDS}s after the user authorizes."
-            ),
-        }), 200
 
     from flask import redirect as flask_redirect
     return flask_redirect(redirect_url, 302)
@@ -2433,7 +2851,13 @@ def oauth_callback() -> tuple[Any, int]:
     # Create or retrieve tenant, mint API key
     db = get_db()
     tenant = db.create_or_get_tenant(guild_id)
-    key_id, raw_key = db.mint_api_key(tenant["tenant_id"])
+    installer_user_id = str(installer_user.get("id", "") or "").strip()
+    installer_username = str(installer_user.get("username", "") or "").strip()
+    key_id, raw_key = db.mint_api_key(
+        tenant["tenant_id"],
+        owner_user_id=installer_user_id,
+        owner_username=installer_username,
+    )
 
     # Store show-once token (configurable TTL; agent or browser picks it up)
     show_token = secrets.token_urlsafe(24)
@@ -2480,13 +2904,7 @@ def oauth_key() -> tuple[Any, int]:
         return jsonify({"error": "missing_token"}), 400
 
     now = int(time.time())
-
-    # Prune expired entries
-    expired = [k for k, v in _SHOW_ONCE.items() if v["expires_at"] <= now]
-    for k in expired:
-        expired_entry = _SHOW_ONCE.pop(k, None)
-        if expired_entry and expired_entry.get("pairing_id"):
-            _PAIRING_INDEX.pop(expired_entry["pairing_id"], None)
+    _prune_oauth_pairing_runtime_state(now)
 
     entry = _SHOW_ONCE.pop(token, None)
     if not entry:
@@ -2494,6 +2912,11 @@ def oauth_key() -> tuple[Any, int]:
             "error": "show_once_token_invalid_or_expired",
             "hint": f"The key can only be retrieved once within {TP_OAUTH_SHOW_ONCE_TTL_SECONDS}s of OAuth. Re-run /oauth/authorize to get a new key.",
         }), 404
+
+    pairing_id = str(entry.get("pairing_id") or "").strip()
+    if pairing_id:
+        _PAIRING_INDEX.pop(pairing_id, None)
+        _CLAIMED_PAIRINGS[pairing_id] = now
 
     return jsonify({
         "api_key": entry["raw_key"],
@@ -2534,42 +2957,70 @@ def oauth_claim() -> tuple[Any, int]:
         return jsonify({"error": "missing_pairing_id"}), 400
 
     now = int(time.time())
-    # Prune expired show-once entries and their pairing index entries
-    expired = [k for k, v in _SHOW_ONCE.items() if v["expires_at"] <= now]
-    for k in expired:
-        expired_entry = _SHOW_ONCE.pop(k, None)
-        if expired_entry and expired_entry.get("pairing_id"):
-            _PAIRING_INDEX.pop(expired_entry["pairing_id"], None)
+    _prune_oauth_pairing_runtime_state(now)
+
+    base_url = TP_BASE_URL or request.url_root.rstrip("/")
+    status_url = f"{base_url}/oauth/status?pairing_id={pairing_id}"
+    claim_url = f"{base_url}/oauth/claim?pairing_id={pairing_id}"
 
     show_token = _PAIRING_INDEX.get(pairing_id)
     if not show_token:
-        # 202: user may not have authorized yet — safe for the agent to poll
+        if pairing_id in _CLAIMED_PAIRINGS:
+            return jsonify(
+                {
+                    "status": "already_claimed",
+                    "error": "pairing_already_claimed",
+                    "status_url": status_url,
+                    "hint": "This pairing already yielded a key.",
+                    "next_step": "Start a new pairing via /oauth/link or /oauth/authorize?pairing_id=NEW_ID.",
+                }
+            ), 410
+
+        state_info = get_db().get_oauth_pairing_state(pairing_id)
+        if state_info:
+            # 202: user may not have authorized yet — safe for the agent to poll
+            return jsonify({
+                "status": "awaiting_user_authorization",
+                "error": "pairing_not_ready",
+                "status_url": status_url,
+                "claim_url": claim_url,
+                "hint": "The user has not yet completed authorization.",
+                "next_step": "Poll status_url until status=ready_to_claim, then call claim_url once.",
+            }), 202
+
         return jsonify({
-            "status": "pending_or_expired",
+            "status": "expired_or_unknown",
             "error": "pairing_not_ready",
-            "hint": "The user has not yet completed authorization, or the claim window has expired.",
+            "status_url": status_url,
+            "hint": "This pairing is not active. It may be expired or unknown.",
             "next_step": (
-                f"If the user has not authorized yet, wait and retry. "
-                f"Claims expire {TP_OAUTH_SHOW_ONCE_TTL_SECONDS}s after authorization. "
-                "To restart, call /oauth/authorize?pairing_id=NEW_ID with a fresh pairing_id."
+                "Start a new pairing via /oauth/link or /oauth/authorize?pairing_id=NEW_ID. "
+                f"Claims expire {TP_OAUTH_SHOW_ONCE_TTL_SECONDS}s after authorization."
             ),
         }), 202
 
     _PAIRING_INDEX.pop(pairing_id, None)
     entry = _SHOW_ONCE.pop(show_token, None)
     if not entry:
+        _CLAIMED_PAIRINGS[pairing_id] = now
         return jsonify({
+            "status": "already_claimed",
             "error": "pairing_already_claimed",
+            "status_url": status_url,
             "hint": "This pairing was already claimed or expired.",
         }), 410
 
+    _CLAIMED_PAIRINGS[pairing_id] = now
+
     return jsonify({
+        "status": "claimed",
         "api_key": entry["raw_key"],
         "key_id": entry["key_id"],
         "tenant_id": entry["tenant_id"],
         "guild_id": entry["guild_id"],
         "installer": entry["installer"],
         "is_new_tenant": entry["is_new_tenant"],
+        "status_url": status_url,
         "usage_hint": (
             "Pass this key as ?tp_key=YOUR_KEY on any /messages request. "
             "Keep it secret. To rotate, call /oauth/authorize with a new pairing_id."
@@ -2618,7 +3069,12 @@ def issue_key() -> tuple[Any, int]:
         return jsonify({"error": exc.message}), exc.status_code
 
     db = get_db()
-    key_id, raw_key = db.mint_api_key(auth_context.tenant_id)
+    current_key = db.get_api_key(auth_context.key_id)
+    key_id, raw_key = db.mint_api_key(
+        auth_context.tenant_id,
+        owner_user_id=str((current_key or {}).get("owner_user_id") or "").strip(),
+        owner_username=str((current_key or {}).get("owner_username") or "").strip(),
+    )
 
     db.audit_log(
         caller_id=auth_context.caller_id,

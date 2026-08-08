@@ -86,6 +86,8 @@ class Database:
                     key_id TEXT PRIMARY KEY,
                     tenant_id TEXT NOT NULL,
                     key_hash TEXT NOT NULL UNIQUE,
+                    owner_user_id TEXT,
+                    owner_username TEXT,
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL,
                     revoked_at INTEGER,
@@ -93,6 +95,14 @@ class Database:
                 )
                 """
             )
+            try:
+                cursor.execute("ALTER TABLE api_keys ADD COLUMN owner_user_id TEXT")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                cursor.execute("ALTER TABLE api_keys ADD COLUMN owner_username TEXT")
+            except sqlite3.OperationalError:
+                pass
 
             # Channel Grants (per-tenant channel allowlist)
             cursor.execute(
@@ -178,7 +188,7 @@ class Database:
         cursor = conn.cursor()
         cursor.execute(
             """
-            SELECT key_id, tenant_id, created_at, revoked_at
+            SELECT key_id, tenant_id, owner_user_id, owner_username, created_at, revoked_at
             FROM api_keys
             WHERE key_hash = ? AND revoked_at IS NULL
             """,
@@ -190,8 +200,10 @@ class Database:
         return {
             "key_id": row[0],
             "tenant_id": row[1],
-            "created_at": row[2],
-            "revoked_at": row[3],
+            "owner_user_id": row[2],
+            "owner_username": row[3],
+            "created_at": row[4],
+            "revoked_at": row[5],
         }
 
     def get_api_key(self, key_id: str) -> dict[str, Any] | None:
@@ -200,7 +212,7 @@ class Database:
         cursor = conn.cursor()
         cursor.execute(
             """
-            SELECT key_id, tenant_id, created_at, revoked_at
+            SELECT key_id, tenant_id, owner_user_id, owner_username, created_at, revoked_at
             FROM api_keys
             WHERE key_id = ? AND revoked_at IS NULL
             """,
@@ -212,8 +224,10 @@ class Database:
         return {
             "key_id": row[0],
             "tenant_id": row[1],
-            "created_at": row[2],
-            "revoked_at": row[3],
+            "owner_user_id": row[2],
+            "owner_username": row[3],
+            "created_at": row[4],
+            "revoked_at": row[5],
         }
 
     def is_channel_allowed_for_tenant(
@@ -350,7 +364,14 @@ class Database:
         conn.commit()
         return {"tenant_id": tenant_id, "guild_id": guild_id, "created_at": now, "is_new": True}
 
-    def mint_api_key(self, tenant_id: str, label: str = "") -> tuple[str, str]:
+    def mint_api_key(
+        self,
+        tenant_id: str,
+        label: str = "",
+        *,
+        owner_user_id: str = "",
+        owner_username: str = "",
+    ) -> tuple[str, str]:
         """Create a new API key for a tenant.
         
         Returns (key_id, raw_key). The raw_key is only returned here and never
@@ -364,10 +385,26 @@ class Database:
         cursor = conn.cursor()
         cursor.execute(
             """
-            INSERT INTO api_keys (key_id, tenant_id, key_hash, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO api_keys (
+                key_id,
+                tenant_id,
+                key_hash,
+                owner_user_id,
+                owner_username,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (key_id, tenant_id, key_hash, now, now),
+            (
+                key_id,
+                tenant_id,
+                key_hash,
+                owner_user_id.strip() or None,
+                owner_username.strip() or None,
+                now,
+                now,
+            ),
         )
         conn.commit()
         return key_id, raw_key
@@ -383,7 +420,7 @@ class Database:
         if include_revoked:
             cursor.execute(
                 """
-                SELECT key_id, tenant_id, created_at, updated_at, revoked_at
+                SELECT key_id, tenant_id, owner_user_id, owner_username, created_at, updated_at, revoked_at
                 FROM api_keys
                 WHERE tenant_id = ?
                 ORDER BY created_at DESC
@@ -393,7 +430,7 @@ class Database:
         else:
             cursor.execute(
                 """
-                SELECT key_id, tenant_id, created_at, updated_at, revoked_at
+                SELECT key_id, tenant_id, owner_user_id, owner_username, created_at, updated_at, revoked_at
                 FROM api_keys
                 WHERE tenant_id = ? AND revoked_at IS NULL
                 ORDER BY created_at DESC
@@ -406,9 +443,11 @@ class Database:
             {
                 "key_id": row[0],
                 "tenant_id": row[1],
-                "created_at": row[2],
-                "updated_at": row[3],
-                "revoked_at": row[4],
+                "owner_user_id": row[2],
+                "owner_username": row[3],
+                "created_at": row[4],
+                "updated_at": row[5],
+                "revoked_at": row[6],
             }
             for row in rows
         ]
@@ -536,6 +575,30 @@ class Database:
         cursor.execute("DELETE FROM oauth_states WHERE state = ?", (state,))
         conn.commit()
         return True, pairing_id
+
+    def get_oauth_pairing_state(self, pairing_id: str) -> dict[str, Any] | None:
+        """Return active OAuth state info for a pairing_id, if still pending."""
+        now = int(time.time())
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT state, created_at, expires_at
+            FROM oauth_states
+            WHERE pairing_id = ? AND expires_at > ?
+            ORDER BY expires_at DESC
+            LIMIT 1
+            """,
+            (pairing_id, now),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return {
+            "state": row[0],
+            "created_at": row[1],
+            "expires_at": row[2],
+        }
 
     def get_sanitized_system_state(self) -> dict[str, int]:
         """Return aggregate, non-identifying counts for health reporting."""
