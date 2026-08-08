@@ -39,7 +39,7 @@ except ImportError:
     init_db = None
     AuthContext = None
 
-BOT_VERSION = "0.3.3"
+BOT_VERSION = "0.0.1"
 APP_DIR = os.path.dirname(__file__)
 load_dotenv(os.path.join(APP_DIR, ".env"))
 load_dotenv(os.path.join(APP_DIR, ".deploy-stamp.env"))
