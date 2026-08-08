@@ -2033,6 +2033,8 @@ def _discord_signature_is_valid(raw_body: bytes) -> bool:
 
 
 @app.route("/discord/interactions", methods=["GET", "HEAD", "OPTIONS", "POST"])
+@app.route("/discord/interactions/", methods=["GET", "HEAD", "OPTIONS", "POST"])
+@app.route("/api/discord/interactions", methods=["GET", "HEAD", "OPTIONS", "POST"])
 def discord_interactions() -> tuple[Any, int]:
     """Handle Discord HTTP interactions (PING and /help slash command)."""
     request_started_at = time.perf_counter()
