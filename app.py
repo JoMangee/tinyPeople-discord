@@ -2033,60 +2033,86 @@ def discord_interactions() -> tuple[Any, int]:
             }
         )
 
-    # Discord interaction verification handshake.
-    if itype in {1, "1"}:
-        # Keep this path permissive so endpoint verification can succeed even
-        # before signature config is fully wired.
-        return jsonify({"type": 1}), 200
+    def _mark_interaction(**updates: Any) -> None:
+        """Merge status telemetry for operator diagnostics."""
+        with _LAST_DISCORD_INTERACTION_LOCK:
+            _LAST_DISCORD_INTERACTION.update(updates)
 
     if not signature_valid:
+        _mark_interaction(status="rejected", error="invalid_discord_signature")
         return jsonify({"error": "invalid_discord_signature"}), 401
+
+    # Discord interaction verification handshake.
+    if itype in {1, "1"}:
+        _mark_interaction(status="responded", response_type=1)
+        return jsonify({"type": 1}), 200
 
     # Slash command invocation.
     if itype == 2:
         command = (payload.get("data") or {}).get("name", "")
-        if command == "help":
-            base_url = TP_BASE_URL or request.url_root.rstrip("/")
-            content = _build_help_text(base_url)
-            # Discord message content limit is 2000 chars.
-            if len(content) > 1900:
-                content = (
-                    "tinyPeople help:\n"
-                    f"{base_url}/help\n"
-                    "Use the /help endpoint for full plain-text instructions."
+        _mark_interaction(command=command)
+        try:
+            if command == "help":
+                base_url = TP_BASE_URL or request.url_root.rstrip("/")
+                content = _build_help_text(base_url)
+                # Discord message content limit is 2000 chars.
+                if len(content) > 1900:
+                    content = (
+                        "tinyPeople help:\n"
+                        f"{base_url}/help\n"
+                        "Use the /help endpoint for full plain-text instructions."
+                    )
+                _mark_interaction(status="responded", response_type=4, handler="help")
+                return jsonify({"type": 4, "data": {"content": content}}), 200
+
+            if command == "connect":
+                # Create a pairing that can be completed without copy/paste key handling.
+                interaction_user = payload.get("member") or payload.get("user") or {}
+                if isinstance(interaction_user, dict) and isinstance(interaction_user.get("user"), dict):
+                    interaction_user = interaction_user.get("user") or {}
+                discord_user_id = str((interaction_user or {}).get("id") or "").strip()
+                random_tail = secrets.token_urlsafe(8)
+                if discord_user_id:
+                    pairing_id = f"tp-dc-{discord_user_id[-6:]}-{random_tail}"
+                else:
+                    pairing_id = f"tp-dc-{random_tail}"
+
+                pairing_payload = _start_oauth_pairing(pairing_id)
+                authorize_url = str(pairing_payload.get("authorize_url") or "")
+                status_url = str(pairing_payload.get("status_url") or "")
+                claim_url = str(pairing_payload.get("claim_url") or "")
+
+                content = "\n".join(
+                    [
+                        "Connect tinyPeople in 3 steps:",
+                        f"1) Open this link and approve: {authorize_url}",
+                        f"2) Poll status: {status_url}",
+                        f"3) Claim key when ready: {claim_url}",
+                        "No key copy/paste by the user is required.",
+                    ]
                 )
-            return jsonify({"type": 4, "data": {"content": content}}), 200
+                _mark_interaction(status="responded", response_type=4, handler="connect")
+                return jsonify({"type": 4, "data": {"content": content, "flags": 64}}), 200
 
-        if command == "connect":
-            # Create a pairing that can be completed without copy/paste key handling.
-            interaction_user = payload.get("member") or payload.get("user") or {}
-            if isinstance(interaction_user, dict) and isinstance(interaction_user.get("user"), dict):
-                interaction_user = interaction_user.get("user") or {}
-            discord_user_id = str((interaction_user or {}).get("id") or "").strip()
-            random_tail = secrets.token_urlsafe(8)
-            if discord_user_id:
-                pairing_id = f"tp-dc-{discord_user_id[-6:]}-{random_tail}"
-            else:
-                pairing_id = f"tp-dc-{random_tail}"
-
-            pairing_payload = _start_oauth_pairing(pairing_id)
-            authorize_url = str(pairing_payload.get("authorize_url") or "")
-            status_url = str(pairing_payload.get("status_url") or "")
-            claim_url = str(pairing_payload.get("claim_url") or "")
-
-            content = "\n".join(
-                [
-                    "Connect tinyPeople in 3 steps:",
-                    f"1) Open this link and approve: {authorize_url}",
-                    f"2) Poll status: {status_url}",
-                    f"3) Claim key when ready: {claim_url}",
-                    "No key copy/paste by the user is required.",
-                ]
+            _mark_interaction(status="responded", response_type=4, handler="unknown")
+            return jsonify({"type": 4, "data": {"content": "Unknown command."}}), 200
+        except Exception as exc:  # pragma: no cover - defensive fallback for Discord SLA
+            _mark_interaction(
+                status="handler_exception",
+                error=type(exc).__name__,
+                error_message=str(exc)[:200],
             )
-            return jsonify({"type": 4, "data": {"content": content, "flags": 64}}), 200
+            return jsonify(
+                {
+                    "type": 4,
+                    "data": {
+                        "content": "tinyPeople had a temporary command error. Please retry in a few seconds.",
+                        "flags": 64,
+                    },
+                }
+            ), 200
 
-        return jsonify({"type": 4, "data": {"content": "Unknown command."}}), 200
-
+    _mark_interaction(status="unsupported_type", error="unsupported_interaction_type")
     return jsonify({"error": "unsupported_interaction_type"}), 400
 
 
