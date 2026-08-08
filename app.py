@@ -2189,14 +2189,20 @@ def discord_interactions() -> tuple[Any, int]:
         )
         return jsonify({"type": 1}), 200
 
-    # Slash command invocation.
+    # Application command invocation (slash + context menu).
     if itype == 2:
         try:
             raw_data = payload.get("data")
             data = raw_data if isinstance(raw_data, dict) else {}
             command = str(data.get("name") or "").strip().lower()
-            _mark_interaction(command=command)
-            if command == "help":
+            command_kind_raw = data.get("type", 1)
+            try:
+                command_kind = int(command_kind_raw)
+            except (TypeError, ValueError):
+                command_kind = 1
+
+            _mark_interaction(command=command, command_type=command_kind)
+            if command_kind == 1 and command == "help":
                 base_url = TP_BASE_URL or request.url_root.rstrip("/")
                 content = _build_help_text(base_url)
                 # Discord message content limit is 2000 chars.
@@ -2214,7 +2220,10 @@ def discord_interactions() -> tuple[Any, int]:
                 )
                 return jsonify({"type": 4, "data": {"content": content}}), 200
 
-            if command == "connect":
+            if (
+                (command_kind == 1 and command == "connect")
+                or (command_kind == 2 and command == "tinypeople connect")
+            ):
                 # Create a pairing that can be completed without copy/paste key handling.
                 interaction_user = payload.get("member") or payload.get("user") or {}
                 if isinstance(interaction_user, dict) and isinstance(interaction_user.get("user"), dict):
@@ -2243,7 +2252,24 @@ def discord_interactions() -> tuple[Any, int]:
                 _mark_interaction(
                     status="responded",
                     response_type=4,
-                    handler="connect",
+                    handler="connect_context" if command_kind == 2 else "connect",
+                    processing_ms=_finalize_timing(),
+                )
+                return jsonify({"type": 4, "data": {"content": content, "flags": 64}}), 200
+
+            if command_kind == 3 and command == "tinypeople help":
+                base_url = TP_BASE_URL or request.url_root.rstrip("/")
+                content = "\n".join(
+                    [
+                        "tinyPeople help:",
+                        f"{base_url}/help",
+                        "Use /help or /connect in chat for slash command workflows.",
+                    ]
+                )
+                _mark_interaction(
+                    status="responded",
+                    response_type=4,
+                    handler="help_context",
                     processing_ms=_finalize_timing(),
                 )
                 return jsonify({"type": 4, "data": {"content": content, "flags": 64}}), 200
@@ -2361,11 +2387,21 @@ def discord_commands_sync() -> tuple[Any, int]:
         {
             "name": "help",
             "description": "Show tinyPeople API help links",
+            "type": 1,
         },
         {
             "name": "connect",
             "description": "Generate a one-click OAuth connect flow",
-        }
+            "type": 1,
+        },
+        {
+            "name": "tinyPeople Connect",
+            "type": 2,
+        },
+        {
+            "name": "tinyPeople Help",
+            "type": 3,
+        },
     ]
 
     try:
