@@ -23,7 +23,7 @@ from typing import Any
 
 import requests
 from dotenv import load_dotenv
-from flask import Flask, Response, jsonify, request
+from flask import Flask, Response, g, jsonify, request
 try:
     from nacl.exceptions import BadSignatureError
     from nacl.signing import VerifyKey
@@ -178,6 +178,8 @@ _PAIRING_INDEX: dict[str, str] = {}
 _CLAIMED_PAIRINGS: dict[str, int] = {}
 _LAST_DISCORD_INTERACTION: dict[str, Any] = {}
 _LAST_DISCORD_INTERACTION_LOCK = Lock()
+_DISCORD_INGRESS_EVENTS: deque[dict[str, Any]] = deque(maxlen=100)
+_DISCORD_INGRESS_LOCK = Lock()
 INTERACTION_REQUEST_DURATIONS: deque[tuple[int, float]] = deque()
 INTERACTION_METRICS_LOCK = Lock()
 RECENT_NONCES: dict[str, int] = {}
@@ -187,6 +189,63 @@ MESSAGE_METRICS_LOCK = Lock()
 MENTION_REPLIED_AT: dict[str, int] = {}
 MENTION_REPLIED_AT_LOCK = Lock()
 _BOT_USER_ID_CACHE: str | None = None
+
+
+def _record_discord_ingress_event(event: dict[str, Any]) -> None:
+    """Append one Discord ingress observation to rolling memory."""
+    with _DISCORD_INGRESS_LOCK:
+        _DISCORD_INGRESS_EVENTS.append(event)
+
+
+@app.before_request
+def _capture_discord_ingress_start() -> None:
+    """Capture request-start data for Discord interaction traffic."""
+    user_agent = request.headers.get("User-Agent", "")
+    if "Discord-Interactions/" not in user_agent:
+        return
+
+    started_at = time.perf_counter()
+    g.discord_ingress_started_at = started_at
+    _record_discord_ingress_event(
+        {
+            "ts": int(time.time()),
+            "phase": "start",
+            "method": request.method,
+            "path": request.path,
+            "query_string": request.query_string.decode("utf-8", errors="replace"),
+            "content_type": request.headers.get("Content-Type", ""),
+            "content_length": request.content_length,
+            "has_sig_header": bool(request.headers.get("X-Signature-Ed25519", "").strip()),
+            "has_ts_header": bool(request.headers.get("X-Signature-Timestamp", "").strip()),
+            "user_agent": user_agent,
+        }
+    )
+
+
+@app.after_request
+def _capture_discord_ingress_end(response: Response) -> Response:
+    """Capture request-end data for Discord interaction traffic."""
+    user_agent = request.headers.get("User-Agent", "")
+    if "Discord-Interactions/" not in user_agent:
+        return response
+
+    started_at = getattr(g, "discord_ingress_started_at", None)
+    processing_ms = None
+    if started_at is not None:
+        processing_ms = round((time.perf_counter() - started_at) * 1000.0, 2)
+
+    _record_discord_ingress_event(
+        {
+            "ts": int(time.time()),
+            "phase": "end",
+            "method": request.method,
+            "path": request.path,
+            "status_code": int(response.status_code),
+            "processing_ms": processing_ms,
+            "user_agent": user_agent,
+        }
+    )
+    return response
 
 
 @dataclass
@@ -2271,6 +2330,20 @@ def discord_interactions_metrics() -> tuple[Any, int]:
     if last_payload:
         response["last_interaction"] = last_payload
     return jsonify(response), 200
+
+
+@app.route("/discord/interactions/ingress", methods=["GET"])
+def discord_interactions_ingress() -> tuple[Any, int]:
+    """Return recent Discord-Interactions request ingress observations."""
+    try:
+        _authorize_static_digest()
+    except ApiError as exc:
+        return jsonify({"error": exc.message, **(_error_guidance(exc.message) or {})}), exc.status_code
+
+    with _DISCORD_INGRESS_LOCK:
+        events = list(_DISCORD_INGRESS_EVENTS)
+
+    return jsonify({"status": "ok", "count": len(events), "events": events}), 200
 
 
 @app.route("/discord/commands/sync", methods=["GET"])
