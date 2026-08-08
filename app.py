@@ -2049,9 +2049,11 @@ def discord_interactions() -> tuple[Any, int]:
 
     # Slash command invocation.
     if itype == 2:
-        command = (payload.get("data") or {}).get("name", "")
-        _mark_interaction(command=command)
         try:
+            raw_data = payload.get("data")
+            data = raw_data if isinstance(raw_data, dict) else {}
+            command = str(data.get("name") or "").strip().lower()
+            _mark_interaction(command=command)
             if command == "help":
                 base_url = TP_BASE_URL or request.url_root.rstrip("/")
                 content = _build_help_text(base_url)
