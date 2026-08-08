@@ -83,6 +83,9 @@ SIGNED_TIMESTAMP_TOLERANCE_SECONDS = int(
 )
 METRICS_WINDOW_SECONDS = int(os.getenv("METRICS_WINDOW_SECONDS", "60"))
 UNIQUE_HOST_WINDOW_SECONDS = int(os.getenv("UNIQUE_HOST_WINDOW_SECONDS", "300"))
+INTERACTION_METRICS_WINDOW_SECONDS = int(
+    os.getenv("INTERACTION_METRICS_WINDOW_SECONDS", "3600")
+)
 RAW_IMAGE_MODE_MAX_BYTES = int(os.getenv("RAW_IMAGE_MODE_MAX_BYTES", "786432"))
 RAW_IMAGE_CHUNK_CHARS = int(os.getenv("RAW_IMAGE_CHUNK_CHARS", "12000"))
 RAW_IMAGE_FETCH_TIMEOUT_SECONDS = float(os.getenv("RAW_IMAGE_FETCH_TIMEOUT_SECONDS", "15"))
@@ -175,6 +178,8 @@ _PAIRING_INDEX: dict[str, str] = {}
 _CLAIMED_PAIRINGS: dict[str, int] = {}
 _LAST_DISCORD_INTERACTION: dict[str, Any] = {}
 _LAST_DISCORD_INTERACTION_LOCK = Lock()
+INTERACTION_REQUEST_DURATIONS: deque[tuple[int, float]] = deque()
+INTERACTION_METRICS_LOCK = Lock()
 RECENT_NONCES: dict[str, int] = {}
 MESSAGE_REQUEST_TIMESTAMPS: deque[int] = deque()
 MESSAGE_HOST_SEEN_AT: dict[str, int] = {}
@@ -550,6 +555,60 @@ def _message_metrics_snapshot() -> dict[str, Any]:
         "request_rate_per_minute": round(rate_per_minute, 2),
         "unique_hosts_in_window": unique_hosts,
         "unique_hosts_window_seconds": UNIQUE_HOST_WINDOW_SECONDS,
+    }
+
+
+def _prune_interaction_metrics(now: int) -> None:
+    """Prune stale interaction durations outside metrics window."""
+    cutoff = now - INTERACTION_METRICS_WINDOW_SECONDS
+    while (
+        INTERACTION_REQUEST_DURATIONS
+        and INTERACTION_REQUEST_DURATIONS[0][0] < cutoff
+    ):
+        INTERACTION_REQUEST_DURATIONS.popleft()
+
+
+def _record_interaction_duration(duration_ms: float) -> None:
+    """Record one interaction processing duration in milliseconds."""
+    now = int(time.time())
+    with INTERACTION_METRICS_LOCK:
+        INTERACTION_REQUEST_DURATIONS.append((now, float(duration_ms)))
+        _prune_interaction_metrics(now)
+
+
+def _percentile(values: list[float], percentile: float) -> float | None:
+    """Compute percentile from a pre-sorted list."""
+    if not values:
+        return None
+
+    rank = int(round((len(values) - 1) * percentile))
+    rank = max(0, min(rank, len(values) - 1))
+    return round(values[rank], 2)
+
+
+def _interaction_metrics_snapshot() -> dict[str, Any]:
+    """Return rolling latency statistics for Discord interactions."""
+    now = int(time.time())
+    with INTERACTION_METRICS_LOCK:
+        _prune_interaction_metrics(now)
+        durations = [duration for _, duration in INTERACTION_REQUEST_DURATIONS]
+
+    if not durations:
+        return {
+            "window_seconds": INTERACTION_METRICS_WINDOW_SECONDS,
+            "count": 0,
+        }
+
+    sorted_durations = sorted(durations)
+    avg_duration = sum(sorted_durations) / len(sorted_durations)
+    return {
+        "window_seconds": INTERACTION_METRICS_WINDOW_SECONDS,
+        "count": len(sorted_durations),
+        "min": round(sorted_durations[0], 2),
+        "avg": round(avg_duration, 2),
+        "p50": _percentile(sorted_durations, 0.50),
+        "p95": _percentile(sorted_durations, 0.95),
+        "max": round(sorted_durations[-1], 2),
     }
 
 
@@ -1976,10 +2035,19 @@ def _discord_signature_is_valid(raw_body: bytes) -> bool:
 @app.route("/discord/interactions", methods=["GET", "HEAD", "OPTIONS", "POST"])
 def discord_interactions() -> tuple[Any, int]:
     """Handle Discord HTTP interactions (PING and /help slash command)."""
+    request_started_at = time.perf_counter()
+
+    def _finalize_timing() -> float:
+        """Capture and store elapsed handling time for this request."""
+        elapsed_ms = round((time.perf_counter() - request_started_at) * 1000.0, 2)
+        _record_interaction_duration(elapsed_ms)
+        return elapsed_ms
+
     if not DISCORD_INTERACTIONS_ENABLED:
         return jsonify({"error": "discord_interactions_disabled"}), 503
 
     if request.method in {"GET", "HEAD", "OPTIONS"}:
+        elapsed_ms = _finalize_timing()
         with _LAST_DISCORD_INTERACTION_LOCK:
             _LAST_DISCORD_INTERACTION.clear()
             _LAST_DISCORD_INTERACTION.update(
@@ -1991,6 +2059,7 @@ def discord_interactions() -> tuple[Any, int]:
                     "user_agent": request.headers.get("User-Agent", ""),
                     "has_sig_header": bool(request.headers.get("X-Signature-Ed25519", "").strip()),
                     "has_ts_header": bool(request.headers.get("X-Signature-Timestamp", "").strip()),
+                    "processing_ms": elapsed_ms,
                 }
             )
         return jsonify({"status": "ok", "endpoint": "discord_interactions"}), 200
@@ -2000,6 +2069,7 @@ def discord_interactions() -> tuple[Any, int]:
     try:
         payload = json.loads(decoded_body) if raw_body else {}
     except (ValueError, UnicodeDecodeError):
+        elapsed_ms = _finalize_timing()
         with _LAST_DISCORD_INTERACTION_LOCK:
             _LAST_DISCORD_INTERACTION.clear()
             _LAST_DISCORD_INTERACTION.update(
@@ -2011,6 +2081,8 @@ def discord_interactions() -> tuple[Any, int]:
                     "has_sig_header": bool(request.headers.get("X-Signature-Ed25519", "").strip()),
                     "has_ts_header": bool(request.headers.get("X-Signature-Timestamp", "").strip()),
                     "body_preview": decoded_body[:300],
+                    "body_bytes": len(raw_body),
+                    "processing_ms": elapsed_ms,
                 }
             )
         return jsonify({"error": "invalid_interaction_payload"}), 400
@@ -2029,6 +2101,7 @@ def discord_interactions() -> tuple[Any, int]:
                 "has_sig_header": bool(request.headers.get("X-Signature-Ed25519", "").strip()),
                 "has_ts_header": bool(request.headers.get("X-Signature-Timestamp", "").strip()),
                 "signature_valid": signature_valid,
+                "body_bytes": len(raw_body),
                 "body_preview": decoded_body[:300],
             }
         )
@@ -2039,12 +2112,20 @@ def discord_interactions() -> tuple[Any, int]:
             _LAST_DISCORD_INTERACTION.update(updates)
 
     if not signature_valid:
-        _mark_interaction(status="rejected", error="invalid_discord_signature")
+        _mark_interaction(
+            status="rejected",
+            error="invalid_discord_signature",
+            processing_ms=_finalize_timing(),
+        )
         return jsonify({"error": "invalid_discord_signature"}), 401
 
     # Discord interaction verification handshake.
     if itype in {1, "1"}:
-        _mark_interaction(status="responded", response_type=1)
+        _mark_interaction(
+            status="responded",
+            response_type=1,
+            processing_ms=_finalize_timing(),
+        )
         return jsonify({"type": 1}), 200
 
     # Slash command invocation.
@@ -2064,7 +2145,12 @@ def discord_interactions() -> tuple[Any, int]:
                         f"{base_url}/help\n"
                         "Use the /help endpoint for full plain-text instructions."
                     )
-                _mark_interaction(status="responded", response_type=4, handler="help")
+                _mark_interaction(
+                    status="responded",
+                    response_type=4,
+                    handler="help",
+                    processing_ms=_finalize_timing(),
+                )
                 return jsonify({"type": 4, "data": {"content": content}}), 200
 
             if command == "connect":
@@ -2093,16 +2179,27 @@ def discord_interactions() -> tuple[Any, int]:
                         "No key copy/paste by the user is required.",
                     ]
                 )
-                _mark_interaction(status="responded", response_type=4, handler="connect")
+                _mark_interaction(
+                    status="responded",
+                    response_type=4,
+                    handler="connect",
+                    processing_ms=_finalize_timing(),
+                )
                 return jsonify({"type": 4, "data": {"content": content, "flags": 64}}), 200
 
-            _mark_interaction(status="responded", response_type=4, handler="unknown")
+            _mark_interaction(
+                status="responded",
+                response_type=4,
+                handler="unknown",
+                processing_ms=_finalize_timing(),
+            )
             return jsonify({"type": 4, "data": {"content": "Unknown command."}}), 200
         except Exception as exc:  # pragma: no cover - defensive fallback for Discord SLA
             _mark_interaction(
                 status="handler_exception",
                 error=type(exc).__name__,
                 error_message=str(exc)[:200],
+                processing_ms=_finalize_timing(),
             )
             return jsonify(
                 {
@@ -2114,7 +2211,11 @@ def discord_interactions() -> tuple[Any, int]:
                 }
             ), 200
 
-    _mark_interaction(status="unsupported_type", error="unsupported_interaction_type")
+    _mark_interaction(
+        status="unsupported_type",
+        error="unsupported_interaction_type",
+        processing_ms=_finalize_timing(),
+    )
     return jsonify({"error": "unsupported_interaction_type"}), 400
 
 
@@ -2148,6 +2249,26 @@ def discord_interactions_last() -> tuple[Any, int]:
     if not payload:
         return jsonify({"status": "no_interactions_seen"}), 200
     return jsonify(payload), 200
+
+
+@app.route("/discord/interactions/metrics", methods=["GET"])
+def discord_interactions_metrics() -> tuple[Any, int]:
+    """Show rolling interaction timing metrics (operator auth required)."""
+    try:
+        _authorize_static_digest()
+    except ApiError as exc:
+        return jsonify({"error": exc.message, **(_error_guidance(exc.message) or {})}), exc.status_code
+
+    with _LAST_DISCORD_INTERACTION_LOCK:
+        last_payload = dict(_LAST_DISCORD_INTERACTION)
+
+    response: dict[str, Any] = {
+        "status": "ok",
+        "latency_ms": _interaction_metrics_snapshot(),
+    }
+    if last_payload:
+        response["last_interaction"] = last_payload
+    return jsonify(response), 200
 
 
 @app.route("/discord/commands/sync", methods=["GET"])
