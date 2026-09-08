@@ -11,6 +11,7 @@ permissions:
 
 jobs:
   apply-docs-patch:
+    if: github.ref == 'refs/heads/affirm-reply-feature'
     runs-on: ubuntu-latest
     steps:
       - name: Check out affirm-reply-feature
@@ -24,115 +25,159 @@ jobs:
         with:
           python-version: '3.x'
 
-      - name: Apply requested edits with exact anchors
+      - name: Apply requested edits with exact source anchors
         shell: bash
         run: |
-          cat > /tmp/apply.py <<'PY'
+          python - <<'PY'
           from pathlib import Path
+          import os
+          import subprocess
+          import tempfile
+          import py_compile
 
-          ROOT = Path.cwd()
+          root = Path.cwd()
+          workflow = root / '.github' / 'workflows' / 'docs-0.3.4.yml'
 
           def read(path):
-              return (ROOT / path).read_text(encoding="utf-8")
+              return path.read_text(encoding='utf-8')
 
-          def write(path, value):
-              (ROOT / path).write_text(value, encoding="utf-8")
-
-          def replace_once(path, old, new):
+          def replace_once_or_verify(path, old, new, label):
               value = read(path)
-              count = value.count(old)
+              old_count = value.count(old)
+              new_count = value.count(new)
+              if old_count == 1 and new_count == 0:
+                  return value.replace(old, new, 1)
+              if old_count == 0 and new_count == 1:
+                  return value
+              raise RuntimeError(
+                  f'{label}: expected one old anchor or one completed anchor; '
+                  f'old={old_count}, new={new_count}'
+              )
+
+          def require_once(value, needle, label):
+              count = value.count(needle)
               if count != 1:
-                  raise RuntimeError(f"{path}: expected exactly one anchor, found {count}: {old!r}")
-              write(path, value.replace(old, new, 1))
+                  raise RuntimeError(f'{label}: expected exactly one anchor, found {count}')
 
-          changelog = read("CHANGELOG.md")
-          changelog_start = "# Changelog\n\n# Changelog\n\n"
-          if not changelog.startswith(changelog_start):
-              raise RuntimeError("CHANGELOG.md: unexpected exact starting block")
-          old_release = "## 0.3.3 — 2026-07-19"
-          if changelog.count(old_release) != 1:
-              raise RuntimeError("CHANGELOG.md: expected exactly one 0.3.3 release anchor")
+          files = {
+              'CHANGELOG.md': read(root / 'CHANGELOG.md'),
+              'README.md': read(root / 'README.md'),
+              'VERSION': read(root / 'VERSION'),
+              'app.py': read(root / 'app.py'),
+          }
+
+          old_release = '## 0.3.3  2026-07-19\n'
           new_release = (
-              "## 0.3.4 — 2026-09-08\n"
-              "\n"
-              "### Added\n"
-              "- Human-gated affirm-reply flow: GET /discord/replies/propose creates a pending proposal; GET /discord/replies/approve?proposal_id=ID&confirm=1 sends it once. Nothing auto-posts; proposals expire after one hour.\n"
-              "- db.py: reply_proposals table (status pending/approved/sent/expired/failed), UNIQUE (channel_id, source_message_id), atomic claim helper.\n"
-              "\n"
-              "### Changed\n"
-              "- BOT_VERSION bumped to 0.3.4\n"
-              "- README and /help updated for the new endpoints\n"
-              "- /privacy updated: pending proposals hold source context and the proposed reply until approved, expired, or deleted.\n"
-              "\n"
+              '## 0.3.4  2026-09-08\n\n'
+              '### Added\n'
+              '- Human-gated affirm-reply flow: GET /discord/replies/propose creates a pending proposal; GET /discord/replies/approve?proposal_id=ID&confirm=1 sends it once. Nothing auto-posts; proposals expire after one hour.\n'
+              '- db.py: reply_proposals table (status pending/approved/sent/expired/failed), UNIQUE (channel_id, source_message_id), atomic claim helper.\n\n'
+              '### Changed\n'
+              '- BOT_VERSION bumped to 0.3.4\n'
+              '- README and /help updated for the new endpoints\n'
+              '- /privacy updated: pending proposals hold source context and the proposed reply until approved, expired, or deleted.\n\n'
           )
-          write("CHANGELOG.md", changelog.replace(old_release, new_release + old_release, 1))
+          if new_release not in files['CHANGELOG.md']:
+              if files['CHANGELOG.md'].count(old_release) != 1:
+                  raise RuntimeError('CHANGELOG.md: expected exactly one 0.3.3 release anchor')
+              files['CHANGELOG.md'] = files['CHANGELOG.md'].replace(
+                  old_release, new_release + old_release, 1
+              )
+          require_once(files['CHANGELOG.md'], new_release, 'CHANGELOG.md release block')
 
-          replace_once("README.md", "**Version 0.3.3**", "**Version 0.3.4**")
-          replace_once(
-              "README.md",
-              "- GET /discord/mentions/respond\n",
-              "- GET /discord/mentions/respond\n- GET /discord/replies/propose\n- GET /discord/replies/approve\n",
+          files['README.md'] = replace_once_or_verify(
+              root / 'README.md', '**Version 0.3.3**', '**Version 0.3.4**', 'README version'
           )
-          replace_once("VERSION", "0.3.2\n", "0.3.4\n")
-          replace_once("app.py", 'BOT_VERSION = "0.3.3"', 'BOT_VERSION = "0.3.4"')
+          files['README.md'] = replace_once_or_verify(
+              root / 'README.md',
+              '- GET /discord/mentions/respond\n',
+              '- GET /discord/mentions/respond\n- GET /discord/replies/propose\n- GET /discord/replies/approve\n',
+              'README endpoint list',
+          )
+          files['VERSION'] = replace_once_or_verify(
+              root / 'VERSION', '0.3.2\n', '0.3.4\n', 'VERSION'
+          )
+          files['app.py'] = replace_once_or_verify(
+              root / 'app.py', 'BOT_VERSION = "0.3.3"', 'BOT_VERSION = "0.3.4"', 'app version'
+          )
 
-          app = read("app.py")
-          help_anchor = (
-              '            f"{base_url}/messages?discord_url={sample_url}&tp_key=YOUR_API_KEY&tp_debug=1",\n'
-              '            "",\n'
-              '            "Health endpoint:",'
-          )
-          help_replacement = (
-              '            f"{base_url}/messages?discord_url={sample_url}&tp_key=YOUR_API_KEY&tp_debug=1",\n'
-              '            "",\n'
-              '            "Affirm-reply (human-gated; nothing sends until you approve):",\n'
-              '            f"{base_url}/discord/replies/propose?channel_id=CHANNEL_ID&message_id=MESSAGE_ID&reply_message=TEXT&tp_key=YOUR_KEY",\n'
-              '            f"{base_url}/discord/replies/approve?proposal_id=PROPOSAL_ID&tp_key=YOUR_KEY",\n'
-              '            f"{base_url}/discord/replies/approve?proposal_id=PROPOSAL_ID&confirm=1&tp_key=YOUR_KEY",\n'
-              '            "",\n'
-              '            "Health endpoint:",'
-          )
-          if app.count(help_anchor) != 1:
-              raise RuntimeError("app.py: expected exactly one help-text anchor")
-          write("app.py", app.replace(help_anchor, help_replacement, 1))
-
-          app = read("app.py")
-          privacy_route = '@app.route("/privacy")'
-          if app.count(privacy_route) != 1:
-              raise RuntimeError("app.py: expected exactly one privacy route")
-          privacy_start = app.index(privacy_route)
-          privacy_end = app.find('\n\n@app.route("', privacy_start + len(privacy_route))
-          if privacy_end == -1:
-              raise RuntimeError("app.py: privacy block terminator anchor not found")
-          privacy_block = app[privacy_start:privacy_end]
-          privacy_changes = [
+          privacy_pairs = [
               (
-                  "<li>We do not store Discord message content.</li>",
-                  "<li>We do not store Discord message content, except the source-message context and proposed reply held in a pending affirm-reply proposal until it is approved, expires (1 hour), or is deleted.</li>",
+                  '<li>We do not store Discord message content.</li>',
+                  '<li>We do not store Discord message content, except the source-message context and proposed reply held in a pending affirm-reply proposal until it is approved, expires (1 hour), or is deleted.</li>',
+                  'privacy content',
               ),
               (
-                  "<li>We do not store user IDs of people who send messages (only the requesting agent/key).</li>",
-                  "<li>We do not store user IDs of people who send messages, except the requesting agent/key and, transiently, the source author identifier within a pending reply proposal.</li>",
+                  '<li>We do not store user IDs of people who send messages (only the requesting agent/key).</li>',
+                  '<li>We do not store user IDs of people who send messages, except the requesting agent/key and, transiently, the source author identifier within a pending reply proposal.</li>',
+                  'privacy user IDs',
               ),
               (
-                  "<p>Last updated: April 2026</p>",
-                  "<p>Last updated: September 2026</p>",
+                  '<p>Last updated: April 2026</p>',
+                  '<p>Last updated: September 2026</p>',
+                  'privacy date',
               ),
           ]
-          for old, new in privacy_changes:
-              count = privacy_block.count(old)
-              if count != 1:
-                  raise RuntimeError(f"app.py privacy block: expected exactly one anchor, found {count}: {old!r}")
-              privacy_block = privacy_block.replace(old, new, 1)
-          write("app.py", app[:privacy_start] + privacy_block + app[privacy_end:])
+          for old, new, label in privacy_pairs:
+              files['app.py'] = replace_once_or_verify(root / 'app.py', old, new, label)
 
-          workflow = ROOT / ".github/workflows/docs-0.3.4.yml"
+          marker = '            "Affirm-reply (human-gated; nothing sends until you approve):",\n'
+          marker_count = files['app.py'].count(marker)
+          if marker_count == 0:
+              health_lines = [
+                  line for line in files['app.py'].splitlines(keepends=True)
+                  if line.strip() == '"Health endpoint:",'
+              ]
+              if len(health_lines) != 1:
+                  raise RuntimeError(
+                      'app.py: expected exactly one current help health-text anchor, '
+                      f'found {len(health_lines)}'
+                  )
+              health_line = health_lines[0]
+              indent = health_line[:len(health_line) - len(health_line.lstrip())]
+              help_insert = (
+                  indent + '"Affirm-reply (human-gated; nothing sends until you approve):",\n'
+                  + indent + 'f"{base_url}/discord/replies/propose?channel_id=CHANNEL_ID&message_id=MESSAGE_ID&reply_message=TEXT&tp_key=YOUR_KEY",\n'
+                  + indent + 'f"{base_url}/discord/replies/approve?proposal_id=PROPOSAL_ID&tp_key=YOUR_KEY",\n'
+                  + indent + 'f"{base_url}/discord/replies/approve?proposal_id=PROPOSAL_ID&confirm=1&tp_key=YOUR_KEY",\n'
+                  + indent + '"",\n'
+              )
+              files['app.py'] = files['app.py'].replace(health_line, help_insert + health_line, 1)
+          elif marker_count != 1:
+              raise RuntimeError(f'app.py: expected one affirm-reply help marker, found {marker_count}')
+
+          require_once(files['app.py'], marker, 'app.py help marker')
+          for help_anchor in (
+              'f"{base_url}/discord/replies/propose?channel_id=CHANNEL_ID&message_id=MESSAGE_ID&reply_message=TEXT&tp_key=YOUR_KEY",\n',
+              'f"{base_url}/discord/replies/approve?proposal_id=PROPOSAL_ID&tp_key=YOUR_KEY",\n',
+              'f"{base_url}/discord/replies/approve?proposal_id=PROPOSAL_ID&confirm=1&tp_key=YOUR_KEY",\n',
+          ):
+              require_once(files['app.py'], help_anchor, 'app.py help endpoint')
+
+          # Validate the complete candidate set before changing the checkout.
+          with tempfile.TemporaryDirectory() as temp_dir:
+              temp = Path(temp_dir)
+              for name, value in files.items():
+                  candidate = temp / name
+                  candidate.parent.mkdir(parents=True, exist_ok=True)
+                  candidate.write_text(value, encoding='utf-8')
+              py_compile.compile(str(temp / 'app.py'), doraise=True)
+              py_compile.compile(str(root / 'db.py'), doraise=True)
+
+          for name, value in files.items():
+              target = root / name
+              with tempfile.NamedTemporaryFile(
+                  'w', encoding='utf-8', dir=target.parent, delete=False
+              ) as handle:
+                  handle.write(value)
+                  temp_name = handle.name
+              os.replace(temp_name, target)
+
           if not workflow.is_file():
-              raise RuntimeError("workflow self-delete anchor missing")
+              raise RuntimeError('workflow self-delete anchor missing')
           workflow.unlink()
-          print("Applied exact documentation/privacy edits and removed the one-shot workflow")
+          print('Validated candidate files, wrote edits, and removed the one-shot workflow.')
           PY
-          python /tmp/apply.py
 
       - name: Compile Python files
         run: python -m py_compile app.py db.py
@@ -142,13 +187,16 @@ jobs:
         run: |
           set -euo pipefail
           git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -A
-          expected=$(printf '%s\n' CHANGELOG.md README.md VERSION app.py db.py .github/workflows/docs-0.3.4.yml | sort)
-          actual=$(git diff --cached --name-only | sort)
-          if [ "$actual" != "$expected" ]; then
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          expected=$'CHANGELOG.md\nREADME.md\nVERSION\napp.py\n.github/workflows/docs-0.3.4.yml'
+          git add -A -- CHANGELOG.md README.md VERSION app.py .github/workflows/docs-0.3.4.yml
+          actual="$(git diff --cached --name-only | sort)"
+          expected_sorted="$(printf '%s\n' "$expected" | sort)"
+          if [[ "$actual" != "$expected_sorted" ]]; then
             echo 'Unexpected staged paths:' >&2
             printf '%s\n' "$actual" >&2
+            echo 'Expected staged paths:' >&2
+            printf '%s\n' "$expected_sorted" >&2
             exit 1
           fi
           git commit -m 'docs: 0.3.4 changelog readme help privacy updates'
