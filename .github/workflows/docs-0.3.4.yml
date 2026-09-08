@@ -31,7 +31,6 @@ jobs:
           python - <<'PY'
           from pathlib import Path
           import os
-          import subprocess
           import tempfile
           import py_compile
 
@@ -41,8 +40,7 @@ jobs:
           def read(path):
               return path.read_text(encoding='utf-8')
 
-          def replace_once_or_verify(path, old, new, label):
-              value = read(path)
+          def replace_once_or_verify(value, old, new, label):
               old_count = value.count(old)
               new_count = value.count(new)
               if old_count == 1 and new_count == 0:
@@ -66,9 +64,9 @@ jobs:
               'app.py': read(root / 'app.py'),
           }
 
-          old_release = '## 0.3.3  2026-07-19\n'
+          old_release = '## 0.3.3 \u2014 2026-07-19\n'
           new_release = (
-              '## 0.3.4  2026-09-08\n\n'
+              '## 0.3.4 \u2014 2026-09-08\n\n'
               '### Added\n'
               '- Human-gated affirm-reply flow: GET /discord/replies/propose creates a pending proposal; GET /discord/replies/approve?proposal_id=ID&confirm=1 sends it once. Nothing auto-posts; proposals expire after one hour.\n'
               '- db.py: reply_proposals table (status pending/approved/sent/expired/failed), UNIQUE (channel_id, source_message_id), atomic claim helper.\n\n'
@@ -86,19 +84,19 @@ jobs:
           require_once(files['CHANGELOG.md'], new_release, 'CHANGELOG.md release block')
 
           files['README.md'] = replace_once_or_verify(
-              root / 'README.md', '**Version 0.3.3**', '**Version 0.3.4**', 'README version'
+              files['README.md'], '**Version 0.3.3**', '**Version 0.3.4**', 'README version'
           )
           files['README.md'] = replace_once_or_verify(
-              root / 'README.md',
+              files['README.md'],
               '- GET /discord/mentions/respond\n',
               '- GET /discord/mentions/respond\n- GET /discord/replies/propose\n- GET /discord/replies/approve\n',
               'README endpoint list',
           )
           files['VERSION'] = replace_once_or_verify(
-              root / 'VERSION', '0.3.2\n', '0.3.4\n', 'VERSION'
+              files['VERSION'], '0.3.2\n', '0.3.4\n', 'VERSION'
           )
           files['app.py'] = replace_once_or_verify(
-              root / 'app.py', 'BOT_VERSION = "0.3.3"', 'BOT_VERSION = "0.3.4"', 'app version'
+              files['app.py'], 'BOT_VERSION = "0.3.3"', 'BOT_VERSION = "0.3.4"', 'app version'
           )
 
           privacy_pairs = [
@@ -119,11 +117,14 @@ jobs:
               ),
           ]
           for old, new, label in privacy_pairs:
-              files['app.py'] = replace_once_or_verify(root / 'app.py', old, new, label)
+              files['app.py'] = replace_once_or_verify(files['app.py'], old, new, label)
 
-          marker = '            "Affirm-reply (human-gated; nothing sends until you approve):",\n'
-          marker_count = files['app.py'].count(marker)
-          if marker_count == 0:
+          marker_text = '"Affirm-reply (human-gated; nothing sends until you approve):",'
+          marker_lines = [
+              line for line in files['app.py'].splitlines(keepends=True)
+              if line.strip() == marker_text
+          ]
+          if len(marker_lines) == 0:
               health_lines = [
                   line for line in files['app.py'].splitlines(keepends=True)
                   if line.strip() == '"Health endpoint:",'
@@ -136,17 +137,22 @@ jobs:
               health_line = health_lines[0]
               indent = health_line[:len(health_line) - len(health_line.lstrip())]
               help_insert = (
-                  indent + '"Affirm-reply (human-gated; nothing sends until you approve):",\n'
+                  indent + marker_text + '\n'
                   + indent + 'f"{base_url}/discord/replies/propose?channel_id=CHANNEL_ID&message_id=MESSAGE_ID&reply_message=TEXT&tp_key=YOUR_KEY",\n'
                   + indent + 'f"{base_url}/discord/replies/approve?proposal_id=PROPOSAL_ID&tp_key=YOUR_KEY",\n'
                   + indent + 'f"{base_url}/discord/replies/approve?proposal_id=PROPOSAL_ID&confirm=1&tp_key=YOUR_KEY",\n'
                   + indent + '"",\n'
               )
               files['app.py'] = files['app.py'].replace(health_line, help_insert + health_line, 1)
-          elif marker_count != 1:
-              raise RuntimeError(f'app.py: expected one affirm-reply help marker, found {marker_count}')
+          elif len(marker_lines) != 1:
+              raise RuntimeError(f'app.py: expected one affirm-reply help marker, found {len(marker_lines)}')
 
-          require_once(files['app.py'], marker, 'app.py help marker')
+          marker_lines = [
+              line for line in files['app.py'].splitlines(keepends=True)
+              if line.strip() == marker_text
+          ]
+          if len(marker_lines) != 1:
+              raise RuntimeError(f'app.py: expected one completed help marker, found {len(marker_lines)}')
           for help_anchor in (
               'f"{base_url}/discord/replies/propose?channel_id=CHANNEL_ID&message_id=MESSAGE_ID&reply_message=TEXT&tp_key=YOUR_KEY",\n',
               'f"{base_url}/discord/replies/approve?proposal_id=PROPOSAL_ID&tp_key=YOUR_KEY",\n',
@@ -154,7 +160,7 @@ jobs:
           ):
               require_once(files['app.py'], help_anchor, 'app.py help endpoint')
 
-          # Validate the complete candidate set before changing the checkout.
+          # Validate every candidate before changing the checkout.
           with tempfile.TemporaryDirectory() as temp_dir:
               temp = Path(temp_dir)
               for name, value in files.items():
