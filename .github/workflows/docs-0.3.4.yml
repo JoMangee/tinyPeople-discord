@@ -25,7 +25,7 @@ jobs:
       - name: Apply requested edits with exact anchors
         shell: bash
         run: |
-          cat > /tmp/apply_docs_patch.py <<'PY'
+          python -c '
           from pathlib import Path
 
           ROOT = Path.cwd()
@@ -50,22 +50,24 @@ jobs:
           old_release_anchor = "## 0.3.3 — 2026-07-19"
           if changelog.count(old_release_anchor) != 1:
               raise RuntimeError("CHANGELOG.md: missing unique 0.3.3 release anchor")
-          new_release = """## 0.3.4 — 2026-09-08
+          new_release = """
+## 0.3.4 — 2026-09-08
 
-          ### Added
+### Added
           - Human-gated affirm-reply flow: GET /discord/replies/propose creates a pending proposal; GET /discord/replies/approve?proposal_id=ID&confirm=1 sends it once. Nothing auto-posts; proposals expire after one hour.
           - db.py: reply_proposals table (status pending/approved/sent/expired/failed), UNIQUE (channel_id, source_message_id), atomic claim helper.
 
-          ### Changed
+### Changed
           - BOT_VERSION bumped to 0.3.4
           - README and /help updated for the new endpoints
           - /privacy updated: pending proposals hold source context and the proposed reply until approved, expired, or deleted.
 
-          """
+"""
           changelog = changelog.replace(old_release_anchor, new_release + old_release_anchor, 1)
           write("CHANGELOG.md", changelog)
 
           replace_once("README.md", "**Version 0.3.3**", "**Version 0.3.4**")
+
           replace_once(
               "README.md",
               "- GET /discord/mentions/respond\n",
@@ -75,31 +77,33 @@ jobs:
           replace_once("VERSION", "0.3.2\n", "0.3.4\n")
 
           app = read("app.py")
-          old_version = 'BOT_VERSION = "0.3.3"'
+          old_version = "BOT_VERSION = \"0.3.3\""
           if app.count(old_version) != 1:
               raise RuntimeError("app.py: missing unique BOT_VERSION 0.3.3 anchor")
-          app = app.replace(old_version, 'BOT_VERSION = "0.3.4"', 1)
+          app = app.replace(old_version, "BOT_VERSION = \"0.3.4\"", 1)
 
-          help_anchor = '''            f"{base_url}/messages?discord_url={sample_url}&tp_key=YOUR_API_KEY&tp_debug=1",
-  "",
-  "Health endpoint:",'''
-          help_replacement = '''            f"{base_url}/messages?discord_url={sample_url}&tp_key=YOUR_API_KEY&tp_debug=1",
-  "",
-  "Affirm-reply (human-gated; nothing sends until you approve):",
-  f"{base_url}/discord/replies/propose?channel_id=CHANNEL_ID&message_id=MESSAGE_ID&reply_message=TEXT&tp_key=YOUR_KEY",
-  f"{base_url}/discord/replies/approve?proposal_id=PROPOSAL_ID&tp_key=YOUR_KEY",
-  f"{base_url}/discord/replies/approve?proposal_id=PROPOSAL_ID&confirm=1&tp_key=YOUR_KEY",
-  "",
-  "Health endpoint:",'''
+          help_anchor = """            f\"{base_url}/messages?discord_url={sample_url}&tp_key=YOUR_API_KEY&tp_debug=1\",
+  \"\",
+  \"Health endpoint:\",
+"""
+          help_replacement = """            f\"{base_url}/messages?discord_url={sample_url}&tp_key=YOUR_API_KEY&tp_debug=1\",
+  \"\",
+  \"Affirm-reply (human-gated; nothing sends until you approve):\",
+  f\"{base_url}/discord/replies/propose?channel_id=CHANNEL_ID&message_id=MESSAGE_ID&reply_message=TEXT&tp_key=YOUR_KEY\",
+  f\"{base_url}/discord/replies/approve?proposal_id=PROPOSAL_ID&tp_key=YOUR_KEY\",
+  f\"{base_url}/discord/replies/approve?proposal_id=PROPOSAL_ID&confirm=1&tp_key=YOUR_KEY\",
+  \"\",
+  \"Health endpoint:\",
+"""
           if app.count(help_anchor) != 1:
               raise RuntimeError("app.py: missing unique help-text insertion anchor")
           app = app.replace(help_anchor, help_replacement, 1)
 
-          privacy_route = '@app.route("/privacy")'
+          privacy_route = "@app.route(\"/privacy\")"
           privacy_start = app.find(privacy_route)
           if privacy_start == -1:
               raise RuntimeError("app.py: missing privacy route anchor")
-          privacy_end = app.find("\n\n@app.route(", privacy_start + len(privacy_route))
+          privacy_end = app.find("\n\n@app.route(\"", privacy_start + len(privacy_route))
           if privacy_end == -1:
               raise RuntimeError("app.py: missing privacy block terminator anchor")
           privacy_block = app[privacy_start:privacy_end]
@@ -121,8 +125,7 @@ jobs:
               raise RuntimeError("workflow self-delete anchor missing")
           workflow.unlink()
           print("Applied requested edits and removed the one-shot workflow")
-          PY
-          python /tmp/apply_docs_patch.py
+          '
 
       - name: Compile Python files
         run: python -m py_compile app.py db.py
@@ -133,7 +136,7 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
           git add -A
-          expected=$'CHANGELOG.md\nREADME.md\nVERSION\napp.py\n.github/workflows/docs-0.3.4.yml'
+          expected=$'CHANGELOG.md\nREADME.md\nVERSION\napp.py\ndb.py\n.github/workflows/docs-0.3.4.yml'
           actual="$(git diff --cached --name-only | sort)"
           sorted_expected="$(printf '%s\n' "$expected" | sort)"
           if [ "$actual" != "$sorted_expected" ]; then
