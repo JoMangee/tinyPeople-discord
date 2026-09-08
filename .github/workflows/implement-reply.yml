@@ -1,0 +1,365 @@
+name: Implement reply proposal flow
+
+on:
+  push:
+    branches:
+      - affirm-reply-feature
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  implement:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+
+      - name: Apply, validate, and commit the embedded patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          db_path = Path("db.py")
+          db = db_path.read_text()
+          if "REPLY_PROPOSAL_WORKFLOW_DB_V2" not in db:
+              db_patch = r'''
+
+          # REPLY_PROPOSAL_WORKFLOW_DB_V2
+          def _reply_proposal_row(row):
+              if not row:
+                  return None
+              columns = (
+                  "proposal_id", "tenant_id", "channel_id", "source_message_id",
+                  "reply_message", "source_context", "status", "created_at",
+                  "expires_at", "approved_at", "sent_at", "result", "error",
+              )
+              return dict(zip(columns, row))
+
+          def _reply_init_schema(self):
+              _reply_original_init_schema(self)
+              conn = self._get_conn()
+              conn.execute(
+                  """
+                  CREATE TABLE IF NOT EXISTS reply_proposals (
+                      proposal_id TEXT PRIMARY KEY,
+                      tenant_id TEXT NOT NULL,
+                      channel_id TEXT NOT NULL,
+                      source_message_id TEXT NOT NULL,
+                      reply_message TEXT NOT NULL,
+                      source_context TEXT NOT NULL,
+                      status TEXT NOT NULL DEFAULT 'pending'
+                          CHECK(status IN ('pending','approved','sent','expired','failed')),
+                      created_at INTEGER NOT NULL,
+                      expires_at INTEGER NOT NULL,
+                      approved_at INTEGER,
+                      sent_at INTEGER,
+                      result TEXT,
+                      error TEXT,
+                      UNIQUE(channel_id, source_message_id)
+                  )
+                  """
+              )
+              conn.commit()
+
+          def create_reply_proposal(
+              self, proposal_id, tenant_id, channel_id, source_message_id,
+              reply_message, source_context, created_at, expires_at
+          ):
+              conn = self._get_conn()
+              conn.execute(
+                  """
+                  INSERT OR IGNORE INTO reply_proposals
+                  (proposal_id, tenant_id, channel_id, source_message_id,
+                   reply_message, source_context, status, created_at, expires_at)
+                  VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                  """,
+                  (proposal_id, tenant_id, channel_id, source_message_id,
+                   reply_message, source_context, created_at, expires_at),
+              )
+              conn.commit()
+              return (
+                  self.get_reply_proposal(proposal_id)
+                  or self.get_reply_proposal_by_source(channel_id, source_message_id)
+              )
+
+          def get_reply_proposal(self, proposal_id):
+              row = self._get_conn().execute(
+                  """
+                  SELECT proposal_id, tenant_id, channel_id, source_message_id,
+                         reply_message, source_context, status, created_at,
+                         expires_at, approved_at, sent_at, result, error
+                  FROM reply_proposals WHERE proposal_id = ?
+                  """,
+                  (proposal_id,),
+              ).fetchone()
+              return _reply_proposal_row(row)
+
+          def get_reply_proposal_by_source(self, channel_id, source_message_id):
+              row = self._get_conn().execute(
+                  """
+                  SELECT proposal_id, tenant_id, channel_id, source_message_id,
+                         reply_message, source_context, status, created_at,
+                         expires_at, approved_at, sent_at, result, error
+                  FROM reply_proposals
+                  WHERE channel_id = ? AND source_message_id = ?
+                  """,
+                  (channel_id, source_message_id),
+              ).fetchone()
+              return _reply_proposal_row(row)
+
+          def expire_reply_proposal_if_needed(self, proposal_id, now):
+              conn = self._get_conn()
+              cur = conn.execute(
+                  """
+                  UPDATE reply_proposals
+                  SET status = 'expired', error = COALESCE(error, 'expired')
+                  WHERE proposal_id = ? AND status = 'pending' AND expires_at <= ?
+                  """,
+                  (proposal_id, now),
+              )
+              conn.commit()
+              return cur.rowcount > 0
+
+          def claim_reply_proposal(self, proposal_id, now):
+              conn = self._get_conn()
+              cur = conn.execute(
+                  """
+                  UPDATE reply_proposals
+                  SET status = 'approved', approved_at = ?, error = NULL
+                  WHERE proposal_id = ? AND status = 'pending' AND expires_at > ?
+                  """,
+                  (now, proposal_id, now),
+              )
+              conn.commit()
+              return cur.rowcount > 0
+
+          def mark_reply_proposal_sent(self, proposal_id, result="sent"):
+              conn = self._get_conn()
+              cur = conn.execute(
+                  """
+                  UPDATE reply_proposals
+                  SET status = 'sent', sent_at = ?, result = ?, error = NULL
+                  WHERE proposal_id = ? AND status = 'approved'
+                  """,
+                  (int(time.time()), result, proposal_id),
+              )
+              conn.commit()
+              return cur.rowcount > 0
+
+          def restore_reply_proposal_pending(self, proposal_id, error=""):
+              conn = self._get_conn()
+              cur = conn.execute(
+                  """
+                  UPDATE reply_proposals
+                  SET status = 'pending', approved_at = NULL, error = ?
+                  WHERE proposal_id = ? AND status = 'approved'
+                  """,
+                  (error, proposal_id),
+              )
+              conn.commit()
+              return cur.rowcount > 0
+
+          _reply_original_init_schema = Database._init_schema
+          Database._init_schema = _reply_init_schema
+          Database.create_reply_proposal = create_reply_proposal
+          Database.get_reply_proposal = get_reply_proposal
+          Database.get_reply_proposal_by_source = get_reply_proposal_by_source
+          Database.expire_reply_proposal_if_needed = expire_reply_proposal_if_needed
+          Database.claim_reply_proposal = claim_reply_proposal
+          Database.mark_reply_proposal_sent = mark_reply_proposal_sent
+          Database.restore_reply_proposal_pending = restore_reply_proposal_pending
+          '''
+              db += db_patch
+              db_path.write_text(db)
+
+          app_path = Path("app.py")
+          app = app_path.read_text()
+          if "REPLY_PROPOSAL_WORKFLOW_APP_V2" not in app:
+              app = app.replace("import hashlib\n", "import hashlib\nimport html\nfrom urllib.parse import quote\n", 1)
+              app_patch = r'''
+
+          # REPLY_PROPOSAL_WORKFLOW_APP_V2
+          def _reply_authenticate_channel(channel_id):
+              auth_context = _require_tenant_api_key_context()
+              db = get_db()
+              if (
+                  channel_id not in TP_PUBLIC_CHANNEL_IDS
+                  and not db.is_channel_allowed_for_tenant(auth_context.tenant_id, channel_id)
+              ):
+                  raise ApiError("channel_not_allowed_for_tenant", 403)
+              return auth_context, db
+
+          def _reply_response(response, status=None):
+              if not hasattr(response, "headers"):
+                  response = Response(response, mimetype="text/html")
+              response.headers["Cache-Control"] = "no-store"
+              response.headers["Referrer-Policy"] = "no-referrer"
+              response.headers["X-Robots-Tag"] = "noindex"
+              if status is not None:
+                  response.status_code = status
+              return response
+
+          def _reply_error_response(exc):
+              body = f"<p><strong>Error:</strong> {html.escape(str(exc), quote=True)}</p>"
+              return _reply_response(Response(body, mimetype="text/html"), getattr(exc, "status_code", 500))
+
+          def _reply_render(proposal, notice=""):
+              if not proposal:
+                  return _reply_response(Response("<p>Reply proposal not found.</p>", mimetype="text/html"), 404)
+              try:
+                  context = json.loads(proposal.get("source_context") or "{}")
+              except (TypeError, ValueError):
+                  context = {}
+              esc = lambda value: html.escape(str(value or ""), quote=True)
+              proposal_id = esc(proposal.get("proposal_id"))
+              status = esc(proposal.get("status"))
+              source_id = esc(proposal.get("source_message_id"))
+              author = esc(context.get("author_name") or context.get("username") or "unknown")
+              content = esc(context.get("content"))
+              reply = esc(proposal.get("reply_message"))
+              href_id = quote(str(proposal.get("proposal_id") or ""), safe="")
+              base = request.url_root.rstrip("/")
+              approve_url = html.escape(
+                  f"{base}/discord/replies/approve?proposal_id={href_id}", quote=True
+              )
+              confirm_url = html.escape(approve_url + "&confirm=1", quote=True)
+              notice_html = f"<p><strong>{esc(notice)}</strong></p>" if notice else ""
+              body = f"""<!doctype html>
+          <html><head><meta charset="utf-8"><title>Reply proposal</title></head>
+          <body>
+          <h1>Discord reply proposal</h1>
+          {notice_html}
+          <p><strong>Status:</strong> {status}</p>
+          <p><strong>Proposal:</strong> {proposal_id}</p>
+          <p><strong>Source message:</strong> {source_id}</p>
+          <p><strong>Author:</strong> {author}</p>
+          <p><strong>Source:</strong></p><pre>{content}</pre>
+          <p><strong>Reply:</strong></p><pre>{reply}</pre>
+          <p><a href="{approve_url}">Review only</a> or
+          <a href="{confirm_url}">Confirm and send</a>.</p>
+          </body></html>"""
+              return _reply_response(Response(body, mimetype="text/html"))
+
+          def _reply_source_context(source):
+              author = source.get("author") if isinstance(source.get("author"), dict) else {}
+              return json.dumps(
+                  {
+                      "author_name": str(author.get("global_name") or author.get("display_name") or author.get("username") or "unknown"),
+                      "username": str(author.get("username") or ""),
+                      "author_id": str(author.get("id") or source.get("author_id") or ""),
+                      "content": str(source.get("content") or "")[:500],
+                      "timestamp": str(source.get("timestamp") or ""),
+                  },
+                  separators=(",", ":"),
+              )
+
+          @app.route("/discord/replies/propose", methods=["GET"])
+          def discord_replies_propose():
+              try:
+                  channel_id = _validate_channel_id(request.args.get("channel_id"))
+                  source_message_id = _validate_message_id(
+                      request.args.get("message_id") or request.args.get("source_message_id")
+                  )
+                  reply_message = request.args.get("reply_message", "")
+                  if not reply_message.strip():
+                      raise ApiError("missing_reply_message", 400)
+                  auth_context, db = _reply_authenticate_channel(channel_id)
+                  source = _fetch_discord_message_by_id(channel_id, source_message_id)
+                  history = _fetch_discord_messages_raw(channel_id, min(100, max(1, MENTION_REPLY_LOOKBACK_LIMIT)))
+                  bot_user_id = _fetch_discord_bot_user_id()
+                  if _bot_already_replied_to_message(
+                      mention_message_id=source_message_id,
+                      bot_user_id=bot_user_id,
+                      channel_history=history,
+                  ):
+                      return _reply_response(
+                          Response("<p>Already replied to this message.</p>", mimetype="text/html"), 409
+                      )
+                  now = int(time.time())
+                  proposal = db.create_reply_proposal(
+                      proposal_id=secrets.token_urlsafe(32),
+                      tenant_id=auth_context.tenant_id,
+                      channel_id=channel_id,
+                      source_message_id=source_message_id,
+                      reply_message=reply_message,
+                      source_context=_reply_source_context(source),
+                      created_at=now,
+                      expires_at=now + 3600,
+                  )
+                  return _reply_render(proposal, "No message was sent. A human must confirm explicitly.")
+              except ApiError as exc:
+                  return _reply_error_response(exc)
+
+          @app.route("/discord/replies/approve", methods=["GET"])
+          def discord_replies_approve():
+              proposal_id = request.args.get("proposal_id", "").strip()
+              if not proposal_id:
+                  return _reply_response(Response("<p>Missing proposal_id.</p>", mimetype="text/html"), 400)
+              try:
+                  db = get_db()
+                  proposal = db.get_reply_proposal(proposal_id)
+                  if not proposal:
+                      return _reply_response(Response("<p>Reply proposal not found.</p>", mimetype="text/html"), 404)
+                  _auth_context, db = _reply_authenticate_channel(proposal["channel_id"])
+                  now = int(time.time())
+                  db.expire_reply_proposal_if_needed(proposal_id, now)
+                  proposal = db.get_reply_proposal(proposal_id)
+                  confirm = request.args.get("confirm", "").strip().lower() in {"1", "true", "yes", "on"}
+                  if not confirm:
+                      return _reply_render(proposal, "Review only. Nothing will be sent without confirm=1.")
+                  if proposal.get("status") != "pending":
+                      return _reply_render(proposal, "This proposal is not pending and was not sent.")
+                  if not db.claim_reply_proposal(proposal_id, now):
+                      return _reply_render(db.get_reply_proposal(proposal_id), "Another request claimed this proposal, or it expired.")
+                  proposal = db.get_reply_proposal(proposal_id)
+                  channel_id = proposal["channel_id"]
+                  source_message_id = proposal["source_message_id"]
+                  history = _fetch_discord_messages_raw(channel_id, min(100, max(1, MENTION_REPLY_LOOKBACK_LIMIT)))
+                  bot_user_id = _fetch_discord_bot_user_id()
+                  # Re-check Discord after the atomic claim and immediately before send.
+                  if _bot_already_replied_to_message(
+                      mention_message_id=source_message_id,
+                      bot_user_id=bot_user_id,
+                      channel_history=history,
+                  ):
+                      db.mark_reply_proposal_sent(proposal_id, "already_replied")
+                      return _reply_render(db.get_reply_proposal(proposal_id), "Already replied; no duplicate was sent.")
+                  try:
+                      _post_discord_message_reply(
+                          channel_id,
+                          source_message_id,
+                          str(proposal.get("source_context") or ""),
+                          {},
+                          custom_reply_message=proposal["reply_message"],
+                      )
+                  except Exception as exc:
+                      db.restore_reply_proposal_pending(proposal_id, str(exc))
+                      return _reply_render(db.get_reply_proposal(proposal_id), f"Send failed; proposal restored: {exc}")
+                  db.mark_reply_proposal_sent(proposal_id, "sent")
+                  return _reply_render(db.get_reply_proposal(proposal_id), "Reply sent exactly once.")
+              except ApiError as exc:
+                  return _reply_error_response(exc)
+          '''
+              anchor = 'if __name__ == "__main__":'
+              if anchor not in app:
+                  raise SystemExit("app.py main anchor not found")
+              app = app.replace(anchor, app_patch + "\n\n" + anchor, 1)
+              app_path.write_text(app)
+          PY
+
+          python -m py_compile app.py db.py
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app.py db.py
+          git rm -f .github/workflows/implement-reply.yml
+          if ! git diff --cached --quiet; then
+            git commit -m "Implement human-gated reply proposal flow"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
