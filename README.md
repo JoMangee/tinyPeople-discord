@@ -93,6 +93,22 @@ Repo-local ingest guide: [docs/tinyPeople-discord-channel-ingest-public.md](docs
 
 API key requests are tenant-scoped. A key can only access channels granted to its tenant.
 
+## Human-Gated Discord Replies
+
+Agents create a pending proposal with an API key:
+
+```text
+GET /discord/replies/propose?channel_id=CHANNEL_ID&message_id=MESSAGE_ID&reply_message=TEXT&tp_key=YOUR_KEY
+```
+
+The response includes a one-hour, single-use approval token. Use it to create a safe review link:
+
+```text
+GET /discord/replies/approve?proposal_id=PROPOSAL_ID&token=APPROVAL_TOKEN
+```
+
+The review link is safe to share and preview: `GET` never sends, even if `confirm=1` is added. A human must open the review page and press **Confirm and send**, which submits an explicit `POST`. Do not put `tp_key` in the approval URL.
+
 ## Key Lifecycle API (Tenant Scoped)
 
 All key lifecycle routes require a valid tenant API key in tp_key (or X-TinyPeople-Key).

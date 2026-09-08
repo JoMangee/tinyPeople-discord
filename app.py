@@ -1854,8 +1854,10 @@ def _build_help_text(base_url: str) -> str:
             "",
             "Affirm-reply (human-gated; nothing sends until you approve):",
             f"{base_url}/discord/replies/propose?channel_id=CHANNEL_ID&message_id=MESSAGE_ID&reply_message=TEXT&tp_key=YOUR_KEY",
-            f"{base_url}/discord/replies/approve?proposal_id=PROPOSAL_ID&tp_key=YOUR_KEY",
-            f"{base_url}/discord/replies/approve?proposal_id=PROPOSAL_ID&confirm=1&tp_key=YOUR_KEY",
+            "The propose response returns a one-hour, single-use approval token.",
+            f"{base_url}/discord/replies/approve?proposal_id=PROPOSAL_ID&token=APPROVAL_TOKEN",
+            "Share the review link above if needed; GET never sends, even with confirm=1.",
+            "To send, open the review page and press its Confirm and send button (explicit POST only).",
             "Health endpoint:",
             f"{base_url}/health",
         ]
