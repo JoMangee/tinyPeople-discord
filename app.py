@@ -12,6 +12,8 @@ from collections import deque
 from datetime import datetime, timezone
 import hmac
 import hashlib
+import html
+from urllib.parse import quote
 import json
 import os
 import re
@@ -39,7 +41,7 @@ except ImportError:
     init_db = None
     AuthContext = None
 
-BOT_VERSION = "0.3.6"
+BOT_VERSION = "0.3.7"
 APP_DIR = os.path.dirname(__file__)
 load_dotenv(os.path.join(APP_DIR, ".env"))
 load_dotenv(os.path.join(APP_DIR, ".deploy-stamp.env"))
@@ -1823,6 +1825,10 @@ def _build_help_text(base_url: str) -> str:
             f"{base_url}/messages?discord_url={sample_url}&tp_key=YOUR_KEY",
             f"{base_url}/messages?discord_url={sample_url}&tp_key=YOUR_KEY&tp_debug=1",
             "",
+            "Affirm-reply (human-gated; nothing sends until you approve):",
+            f"{base_url}/discord/replies/propose?channel_id=CHANNEL_ID&message_id=MESSAGE_ID&reply_message=TEXT&tp_key=YOUR_KEY",
+            f"{base_url}/discord/replies/approve?proposal_id=PROPOSAL_ID&tp_key=YOUR_KEY",
+            f"{base_url}/discord/replies/approve?proposal_id=PROPOSAL_ID&confirm=1&tp_key=YOUR_KEY",
             "Health endpoint:",
             f"{base_url}/health",
         ]
@@ -3595,7 +3601,7 @@ h1{{font-size:1.5rem}}h2{{font-size:1.1rem;margin-top:2rem}}</style>
 <body>
 <h1>Privacy Policy</h1>
 <p><strong>{TP_SERVICE_NAME}</strong></p>
-<p>Last updated: April 2026</p>
+<p>Last updated: September 2026</p>
 
 <h2>What we collect</h2>
 <ul>
@@ -3608,8 +3614,8 @@ h1{{font-size:1.5rem}}h2{{font-size:1.1rem;margin-top:2rem}}</style>
 
 <h2>What we do not collect</h2>
 <ul>
-  <li>We do not store Discord message content.</li>
-  <li>We do not store user IDs of people who send messages (only the requesting agent/key).</li>
+  <li>We do not store Discord message content, except the source-message context and proposed reply held in a pending affirm-reply proposal until it is approved, expires (1 hour), or is deleted.</li>
+  <li>We do not store user IDs of people who send messages, except the requesting agent/key and, transiently, the source author identifier within a pending reply proposal.</li>
   <li>We do not sell or share data with third parties.</li>
 </ul>
 
@@ -3625,6 +3631,171 @@ You can request deletion by revoking your bot from your server and contacting th
 </body>
 </html>"""
     return Response(body, mimetype="text/html"), 200
+
+
+
+
+# REPLY_PROPOSAL_WORKFLOW_APP_V2
+def _reply_authenticate_channel(channel_id):
+    auth_context = _require_tenant_api_key_context()
+    db = get_db()
+    if (
+        channel_id not in TP_PUBLIC_CHANNEL_IDS
+        and not db.is_channel_allowed_for_tenant(auth_context.tenant_id, channel_id)
+    ):
+        raise ApiError("channel_not_allowed_for_tenant", 403)
+    return auth_context, db
+
+def _reply_response(response, status=None):
+    if not hasattr(response, "headers"):
+        response = Response(response, mimetype="text/html")
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["X-Robots-Tag"] = "noindex"
+    if status is not None:
+        response.status_code = status
+    return response
+
+def _reply_error_response(exc):
+    body = f"<p><strong>Error:</strong> {html.escape(str(exc), quote=True)}</p>"
+    return _reply_response(Response(body, mimetype="text/html"), getattr(exc, "status_code", 500))
+
+def _reply_render(proposal, notice=""):
+    if not proposal:
+        return _reply_response(Response("<p>Reply proposal not found.</p>", mimetype="text/html"), 404)
+    try:
+        context = json.loads(proposal.get("source_context") or "{}")
+    except (TypeError, ValueError):
+        context = {}
+    esc = lambda value: html.escape(str(value or ""), quote=True)
+    proposal_id = esc(proposal.get("proposal_id"))
+    status = esc(proposal.get("status"))
+    source_id = esc(proposal.get("source_message_id"))
+    author = esc(context.get("author_name") or context.get("username") or "unknown")
+    content = esc(context.get("content"))
+    reply = esc(proposal.get("reply_message"))
+    href_id = quote(str(proposal.get("proposal_id") or ""), safe="")
+    base = request.url_root.rstrip("/")
+    approve_url = html.escape(
+        f"{base}/discord/replies/approve?proposal_id={href_id}", quote=True
+    )
+    confirm_url = html.escape(approve_url + "&confirm=1", quote=True)
+    notice_html = f"<p><strong>{esc(notice)}</strong></p>" if notice else ""
+    body = f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>Reply proposal</title></head>
+<body>
+<h1>Discord reply proposal</h1>
+{notice_html}
+<p><strong>Status:</strong> {status}</p>
+<p><strong>Proposal:</strong> {proposal_id}</p>
+<p><strong>Source message:</strong> {source_id}</p>
+<p><strong>Author:</strong> {author}</p>
+<p><strong>Source:</strong></p><pre>{content}</pre>
+<p><strong>Reply:</strong></p><pre>{reply}</pre>
+<p><a href="{approve_url}">Review only</a> or
+<a href="{confirm_url}">Confirm and send</a>.</p>
+</body></html>"""
+    return _reply_response(Response(body, mimetype="text/html"))
+
+def _reply_source_context(source):
+    author = source.get("author") if isinstance(source.get("author"), dict) else {}
+    return json.dumps(
+        {
+            "author_name": str(author.get("global_name") or author.get("display_name") or author.get("username") or "unknown"),
+            "username": str(author.get("username") or ""),
+            "author_id": str(author.get("id") or source.get("author_id") or ""),
+            "content": str(source.get("content") or "")[:500],
+            "timestamp": str(source.get("timestamp") or ""),
+        },
+        separators=(",", ":"),
+    )
+
+@app.route("/discord/replies/propose", methods=["GET"])
+def discord_replies_propose():
+    try:
+        channel_id = _validate_channel_id(request.args.get("channel_id"))
+        source_message_id = _validate_message_id(
+            request.args.get("message_id") or request.args.get("source_message_id")
+        )
+        reply_message = request.args.get("reply_message", "")
+        if not reply_message.strip():
+            raise ApiError("missing_reply_message", 400)
+        auth_context, db = _reply_authenticate_channel(channel_id)
+        source = _fetch_discord_message_by_id(channel_id, source_message_id)
+        history = _fetch_discord_messages_raw(channel_id, min(100, max(1, MENTION_REPLY_LOOKBACK_LIMIT)))
+        bot_user_id = _fetch_discord_bot_user_id()
+        if _bot_already_replied_to_message(
+            mention_message_id=source_message_id,
+            bot_user_id=bot_user_id,
+            channel_history=history,
+        ):
+            return _reply_response(
+                Response("<p>Already replied to this message.</p>", mimetype="text/html"), 409
+            )
+        now = int(time.time())
+        proposal = db.create_reply_proposal(
+            proposal_id=secrets.token_urlsafe(32),
+            tenant_id=auth_context.tenant_id,
+            channel_id=channel_id,
+            source_message_id=source_message_id,
+            reply_message=reply_message,
+            source_context=_reply_source_context(source),
+            created_at=now,
+            expires_at=now + 3600,
+        )
+        return _reply_render(proposal, "No message was sent. A human must confirm explicitly.")
+    except ApiError as exc:
+        return _reply_error_response(exc)
+
+@app.route("/discord/replies/approve", methods=["GET"])
+def discord_replies_approve():
+    proposal_id = request.args.get("proposal_id", "").strip()
+    if not proposal_id:
+        return _reply_response(Response("<p>Missing proposal_id.</p>", mimetype="text/html"), 400)
+    try:
+        db = get_db()
+        proposal = db.get_reply_proposal(proposal_id)
+        if not proposal:
+            return _reply_response(Response("<p>Reply proposal not found.</p>", mimetype="text/html"), 404)
+        _auth_context, db = _reply_authenticate_channel(proposal["channel_id"])
+        now = int(time.time())
+        db.expire_reply_proposal_if_needed(proposal_id, now)
+        proposal = db.get_reply_proposal(proposal_id)
+        confirm = request.args.get("confirm", "").strip().lower() in {"1", "true", "yes", "on"}
+        if not confirm:
+            return _reply_render(proposal, "Review only. Nothing will be sent without confirm=1.")
+        if proposal.get("status") != "pending":
+            return _reply_render(proposal, "This proposal is not pending and was not sent.")
+        if not db.claim_reply_proposal(proposal_id, now):
+            return _reply_render(db.get_reply_proposal(proposal_id), "Another request claimed this proposal, or it expired.")
+        proposal = db.get_reply_proposal(proposal_id)
+        channel_id = proposal["channel_id"]
+        source_message_id = proposal["source_message_id"]
+        history = _fetch_discord_messages_raw(channel_id, min(100, max(1, MENTION_REPLY_LOOKBACK_LIMIT)))
+        bot_user_id = _fetch_discord_bot_user_id()
+        # Re-check Discord after the atomic claim and immediately before send.
+        if _bot_already_replied_to_message(
+            mention_message_id=source_message_id,
+            bot_user_id=bot_user_id,
+            channel_history=history,
+        ):
+            db.mark_reply_proposal_sent(proposal_id, "already_replied")
+            return _reply_render(db.get_reply_proposal(proposal_id), "Already replied; no duplicate was sent.")
+        try:
+            _post_discord_message_reply(
+                channel_id,
+                source_message_id,
+                str(proposal.get("source_context") or ""),
+                {},
+                custom_reply_message=proposal["reply_message"],
+            )
+        except Exception as exc:
+            db.restore_reply_proposal_pending(proposal_id, str(exc))
+            return _reply_render(db.get_reply_proposal(proposal_id), f"Send failed; proposal restored: {exc}")
+        db.mark_reply_proposal_sent(proposal_id, "sent")
+        return _reply_render(db.get_reply_proposal(proposal_id), "Reply sent exactly once.")
+    except ApiError as exc:
+        return _reply_error_response(exc)
 
 
 if __name__ == "__main__":
