@@ -41,7 +41,7 @@ except ImportError:
     init_db = None
     AuthContext = None
 
-BOT_VERSION = "0.3.8"
+BOT_VERSION = "0.3.9"
 APP_DIR = os.path.dirname(__file__)
 load_dotenv(os.path.join(APP_DIR, ".env"))
 load_dotenv(os.path.join(APP_DIR, ".deploy-stamp.env"))
@@ -3732,15 +3732,23 @@ def _reply_render(proposal, notice="", token=None):
     )
     href_id = quote(str(proposal.get("proposal_id") or ""), safe="")
     if token is None:
-        token = request.args.get("token", "").strip()
+        token = request.args.get("token", "") or request.form.get("token", "")
+        token = token.strip()
     token_qs = f"&token={quote(token, safe='')}" if token else ""
     base = request.url_root.rstrip("/")
     approve_url = html.escape(
         f"{base}/discord/replies/approve?proposal_id={href_id}{token_qs}", quote=True
     )
-    confirm_url = html.escape(approve_url + "&confirm=1", quote=True)
     notice_html = f"<p><strong>{esc(notice)}</strong></p>" if notice else ""
     expires_html = f"<p><strong>Expires:</strong> {expires_text} (proposals are single-use and expire after 1 hour)</p>" if expires_text else ""
+    # Sending requires an explicit POST form submission, not a GET link, so link
+    # previews/prefetchers/crawlers visiting this URL can never trigger a send.
+    confirm_form = f"""<form method="post" action="{approve_url}">
+<input type="hidden" name="proposal_id" value="{proposal_id}">
+<input type="hidden" name="token" value="{esc(token)}">
+<input type="hidden" name="confirm" value="1">
+<button type="submit">Confirm and send</button>
+</form>"""
     body = f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>Reply proposal</title></head>
 <body>
@@ -3753,8 +3761,8 @@ def _reply_render(proposal, notice="", token=None):
 <p><strong>Author:</strong> {author}</p>
 <p><strong>Source:</strong></p><pre>{content}</pre>
 <p><strong>Reply:</strong></p><pre>{reply}</pre>
-<p><a href="{approve_url}">Review only</a> or
-<a href="{confirm_url}">Confirm and send</a>.</p>
+<p><a href="{approve_url}">Review only</a> (safe to preview/share; never sends)</p>
+{confirm_form}
 </body></html>"""
     return _reply_response(Response(body, mimetype="text/html"))
 
@@ -3814,10 +3822,10 @@ def discord_replies_propose():
     except ApiError as exc:
         return _reply_error_response(exc)
 
-@app.route("/discord/replies/approve", methods=["GET"])
+@app.route("/discord/replies/approve", methods=["GET", "POST"])
 def discord_replies_approve():
-    proposal_id = request.args.get("proposal_id", "").strip()
-    token = request.args.get("token", "").strip()
+    proposal_id = request.values.get("proposal_id", "").strip()
+    token = request.values.get("token", "").strip()
     if not proposal_id:
         return _reply_response(Response("<p>Missing proposal_id.</p>", mimetype="text/html"), 400)
     try:
@@ -3832,9 +3840,13 @@ def discord_replies_approve():
         now = int(time.time())
         db.expire_reply_proposal_if_needed(proposal_id, now)
         proposal = db.get_reply_proposal(proposal_id)
-        confirm = request.args.get("confirm", "").strip().lower() in {"1", "true", "yes", "on"}
+        # Sending only ever happens on an explicit POST (form submit). A GET
+        # can never send, even with confirm=1, so link previews/crawlers/prefetchers
+        # that fetch a shared URL (e.g. Discord unfurling a pasted link) can't trigger it.
+        confirm = request.method == "POST" and request.form.get("confirm", "").strip().lower() in {"1", "true", "yes", "on"}
         if not confirm:
-            return _reply_render(proposal, "Review only. Nothing will be sent without confirm=1.", token=token)
+            notice = "Review only. Nothing will be sent without an explicit confirm." if request.method == "GET" else "Review only. Nothing will be sent without confirm=1."
+            return _reply_render(proposal, notice, token=token)
         if proposal.get("status") != "pending":
             return _reply_render(proposal, "This proposal is not pending and was not sent.", token=token)
         if not db.claim_reply_proposal(proposal_id, now):
