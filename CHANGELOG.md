@@ -2,6 +2,17 @@
 
 # Changelog
 
+## 0.3.4 — 2026-09-08
+
+### Added
+- Human-gated affirm-reply flow: GET /discord/replies/propose creates a pending proposal; GET /discord/replies/approve?proposal_id=ID&confirm=1 sends it once. Nothing auto-posts; proposals expire after one hour.
+- db.py: reply_proposals table (status pending/approved/sent/expired/failed), UNIQUE (channel_id, source_message_id), atomic claim helper.
+
+### Changed
+- BOT_VERSION bumped to 0.3.4
+- README and /help updated for the new endpoints
+- /privacy updated: pending proposals hold source context and the proposed reply until approved, expired, or deleted.
+
 ## 0.3.3 — 2026-07-19
 
 ### Changed

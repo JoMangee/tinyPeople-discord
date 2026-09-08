@@ -41,7 +41,7 @@ except ImportError:
     init_db = None
     AuthContext = None
 
-BOT_VERSION = "0.3.3"
+BOT_VERSION = "0.3.4"
 APP_DIR = os.path.dirname(__file__)
 load_dotenv(os.path.join(APP_DIR, ".env"))
 load_dotenv(os.path.join(APP_DIR, ".deploy-stamp.env"))
@@ -1582,6 +1582,10 @@ def _build_help_text(base_url: str) -> str:
             f"{base_url}/messages?discord_url={sample_url}&tp_key=YOUR_KEY",
             f"{base_url}/messages?discord_url={sample_url}&tp_key=YOUR_KEY&tp_debug=1",
             "",
+            "Affirm-reply (human-gated; nothing sends until you approve):",
+            f"{base_url}/discord/replies/propose?channel_id=CHANNEL_ID&message_id=MESSAGE_ID&reply_message=TEXT&tp_key=YOUR_KEY",
+            f"{base_url}/discord/replies/approve?proposal_id=PROPOSAL_ID&tp_key=YOUR_KEY",
+            f"{base_url}/discord/replies/approve?proposal_id=PROPOSAL_ID&confirm=1&tp_key=YOUR_KEY",
             "Health endpoint:",
             f"{base_url}/health",
         ]
@@ -2881,7 +2885,7 @@ h1{{font-size:1.5rem}}h2{{font-size:1.1rem;margin-top:2rem}}</style>
 <body>
 <h1>Privacy Policy</h1>
 <p><strong>{TP_SERVICE_NAME}</strong></p>
-<p>Last updated: April 2026</p>
+<p>Last updated: September 2026</p>
 
 <h2>What we collect</h2>
 <ul>
@@ -2894,8 +2898,8 @@ h1{{font-size:1.5rem}}h2{{font-size:1.1rem;margin-top:2rem}}</style>
 
 <h2>What we do not collect</h2>
 <ul>
-  <li>We do not store Discord message content.</li>
-  <li>We do not store user IDs of people who send messages (only the requesting agent/key).</li>
+  <li>We do not store Discord message content, except the source-message context and proposed reply held in a pending affirm-reply proposal until it is approved, expires (1 hour), or is deleted.</li>
+  <li>We do not store user IDs of people who send messages, except the requesting agent/key and, transiently, the source author identifier within a pending reply proposal.</li>
   <li>We do not sell or share data with third parties.</li>
 </ul>
 
