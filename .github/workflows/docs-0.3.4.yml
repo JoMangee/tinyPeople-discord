@@ -2,6 +2,8 @@ name: docs 0.3.4
 
 on:
   push:
+    branches:
+      - affirm-reply-feature
   workflow_dispatch:
 
 permissions:
@@ -11,7 +13,7 @@ jobs:
   apply-docs-patch:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout affirm-reply-feature
+      - name: Check out affirm-reply-feature
         uses: actions/checkout@v4
         with:
           ref: affirm-reply-feature
@@ -25,7 +27,7 @@ jobs:
       - name: Apply requested edits with exact anchors
         shell: bash
         run: |
-          python -c '
+          cat > /tmp/apply.py <<'PY'
           from pathlib import Path
 
           ROOT = Path.cwd()
@@ -44,88 +46,93 @@ jobs:
               write(path, value.replace(old, new, 1))
 
           changelog = read("CHANGELOG.md")
-          header_block = "# Changelog\n\n# Changelog\n\n"
-          if not changelog.startswith(header_block):
-              raise RuntimeError("CHANGELOG.md: missing exact duplicated header block")
-          old_release_anchor = "## 0.3.3 — 2026-07-19"
-          if changelog.count(old_release_anchor) != 1:
-              raise RuntimeError("CHANGELOG.md: missing unique 0.3.3 release anchor")
+          changelog_start = "# Changelog\n\n# Changelog\n\n"
+          if not changelog.startswith(changelog_start):
+              raise RuntimeError("CHANGELOG.md: unexpected exact starting block")
+          old_release = "## 0.3.3 — 2026-07-19"
+          if changelog.count(old_release) != 1:
+              raise RuntimeError("CHANGELOG.md: expected exactly one 0.3.3 release anchor")
           new_release = (
               "## 0.3.4 — 2026-09-08\n"
               "\n"
               "### Added\n"
-              "          - Human-gated affirm-reply flow: GET /discord/replies/propose creates a pending proposal; GET /discord/replies/approve?proposal_id=ID&confirm=1 sends it once. Nothing auto-posts; proposals expire after one hour.\n"
-              "          - db.py: reply_proposals table (status pending/approved/sent/expired/failed), UNIQUE (channel_id, source_message_id), atomic claim helper.\n"
+              "- Human-gated affirm-reply flow: GET /discord/replies/propose creates a pending proposal; GET /discord/replies/approve?proposal_id=ID&confirm=1 sends it once. Nothing auto-posts; proposals expire after one hour.\n"
+              "- db.py: reply_proposals table (status pending/approved/sent/expired/failed), UNIQUE (channel_id, source_message_id), atomic claim helper.\n"
               "\n"
               "### Changed\n"
-              "          - BOT_VERSION bumped to 0.3.4\n"
-              "          - README and /help updated for the new endpoints\n"
-              "          - /privacy updated: pending proposals hold source context and the proposed reply until approved, expired, or deleted.\n"
+              "- BOT_VERSION bumped to 0.3.4\n"
+              "- README and /help updated for the new endpoints\n"
+              "- /privacy updated: pending proposals hold source context and the proposed reply until approved, expired, or deleted.\n"
               "\n"
           )
-          changelog = changelog.replace(old_release_anchor, new_release + old_release_anchor, 1)
-          write("CHANGELOG.md", changelog)
+          write("CHANGELOG.md", changelog.replace(old_release, new_release + old_release, 1))
 
           replace_once("README.md", "**Version 0.3.3**", "**Version 0.3.4**")
-
           replace_once(
               "README.md",
               "- GET /discord/mentions/respond\n",
               "- GET /discord/mentions/respond\n- GET /discord/replies/propose\n- GET /discord/replies/approve\n",
           )
-
           replace_once("VERSION", "0.3.2\n", "0.3.4\n")
+          replace_once("app.py", 'BOT_VERSION = "0.3.3"', 'BOT_VERSION = "0.3.4"')
 
           app = read("app.py")
-          old_version = "BOT_VERSION = \"0.3.3\""
-          if app.count(old_version) != 1:
-              raise RuntimeError("app.py: missing unique BOT_VERSION 0.3.3 anchor")
-          app = app.replace(old_version, "BOT_VERSION = \"0.3.4\"", 1)
-
-          help_anchor = """            f\"{base_url}/messages?discord_url={sample_url}&tp_key=YOUR_API_KEY&tp_debug=1\",
-  \"\",
-  \"Health endpoint:\",
-"""
-          help_replacement = """            f\"{base_url}/messages?discord_url={sample_url}&tp_key=YOUR_API_KEY&tp_debug=1\",
-  \"\",
-  \"Affirm-reply (human-gated; nothing sends until you approve):\",
-  f\"{base_url}/discord/replies/propose?channel_id=CHANNEL_ID&message_id=MESSAGE_ID&reply_message=TEXT&tp_key=YOUR_KEY\",
-  f\"{base_url}/discord/replies/approve?proposal_id=PROPOSAL_ID&tp_key=YOUR_KEY\",
-  f\"{base_url}/discord/replies/approve?proposal_id=PROPOSAL_ID&confirm=1&tp_key=YOUR_KEY\",
-  \"\",
-  \"Health endpoint:\",
-"""
+          help_anchor = (
+              '            f"{base_url}/messages?discord_url={sample_url}&tp_key=YOUR_API_KEY&tp_debug=1",\n'
+              '            "",\n'
+              '            "Health endpoint:",'
+          )
+          help_replacement = (
+              '            f"{base_url}/messages?discord_url={sample_url}&tp_key=YOUR_API_KEY&tp_debug=1",\n'
+              '            "",\n'
+              '            "Affirm-reply (human-gated; nothing sends until you approve):",\n'
+              '            f"{base_url}/discord/replies/propose?channel_id=CHANNEL_ID&message_id=MESSAGE_ID&reply_message=TEXT&tp_key=YOUR_KEY",\n'
+              '            f"{base_url}/discord/replies/approve?proposal_id=PROPOSAL_ID&tp_key=YOUR_KEY",\n'
+              '            f"{base_url}/discord/replies/approve?proposal_id=PROPOSAL_ID&confirm=1&tp_key=YOUR_KEY",\n'
+              '            "",\n'
+              '            "Health endpoint:",'
+          )
           if app.count(help_anchor) != 1:
-              raise RuntimeError("app.py: missing unique help-text insertion anchor")
-          app = app.replace(help_anchor, help_replacement, 1)
+              raise RuntimeError("app.py: expected exactly one help-text anchor")
+          write("app.py", app.replace(help_anchor, help_replacement, 1))
 
-          privacy_route = "@app.route(\"/privacy\")"
-          privacy_start = app.find(privacy_route)
-          if privacy_start == -1:
-              raise RuntimeError("app.py: missing privacy route anchor")
-          privacy_end = app.find("\n\n@app.route(\"", privacy_start + len(privacy_route))
+          app = read("app.py")
+          privacy_route = '@app.route("/privacy")'
+          if app.count(privacy_route) != 1:
+              raise RuntimeError("app.py: expected exactly one privacy route")
+          privacy_start = app.index(privacy_route)
+          privacy_end = app.find('\n\n@app.route("', privacy_start + len(privacy_route))
           if privacy_end == -1:
-              raise RuntimeError("app.py: missing privacy block terminator anchor")
+              raise RuntimeError("app.py: privacy block terminator anchor not found")
           privacy_block = app[privacy_start:privacy_end]
-          privacy_replacements = {
-              "<li>We do not store Discord message content.</li>": "<li>We do not store Discord message content, except the source-message context and proposed reply held in a pending affirm-reply proposal until it is approved, expires (1 hour), or is deleted.</li>",
-              "<li>We do not store user IDs of people who send messages (only the requesting agent/key).</li>": "<li>We do not store user IDs of people who send messages, except the requesting agent/key and, transiently, the source author identifier within a pending reply proposal.</li>",
-              "<p>Last updated: April 2026</p>": "<p>Last updated: September 2026</p>",
-          }
-          for old, new in privacy_replacements.items():
+          privacy_changes = [
+              (
+                  "<li>We do not store Discord message content.</li>",
+                  "<li>We do not store Discord message content, except the source-message context and proposed reply held in a pending affirm-reply proposal until it is approved, expires (1 hour), or is deleted.</li>",
+              ),
+              (
+                  "<li>We do not store user IDs of people who send messages (only the requesting agent/key).</li>",
+                  "<li>We do not store user IDs of people who send messages, except the requesting agent/key and, transiently, the source author identifier within a pending reply proposal.</li>",
+              ),
+              (
+                  "<p>Last updated: April 2026</p>",
+                  "<p>Last updated: September 2026</p>",
+              ),
+          ]
+          for old, new in privacy_changes:
               count = privacy_block.count(old)
               if count != 1:
                   raise RuntimeError(f"app.py privacy block: expected exactly one anchor, found {count}: {old!r}")
               privacy_block = privacy_block.replace(old, new, 1)
-          app = app[:privacy_start] + privacy_block + app[privacy_end:]
-          write("app.py", app)
+          write("app.py", app[:privacy_start] + privacy_block + app[privacy_end:])
 
           workflow = ROOT / ".github/workflows/docs-0.3.4.yml"
           if not workflow.is_file():
               raise RuntimeError("workflow self-delete anchor missing")
           workflow.unlink()
-          print("Applied requested edits and removed the one-shot workflow")
-          '
+          print("Applied exact documentation/privacy edits and removed the one-shot workflow")
+          PY
+          python /tmp/apply.py
 
       - name: Compile Python files
         run: python -m py_compile app.py db.py
@@ -133,13 +140,13 @@ jobs:
       - name: Commit all resulting changes and push
         shell: bash
         run: |
+          set -euo pipefail
           git config user.name 'github-actions[bot]'
-          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -A
-          expected=$'CHANGELOG.md\nREADME.md\nVERSION\napp.py\ndb.py\n.github/workflows/docs-0.3.4.yml'
-          actual="$(git diff --cached --name-only | sort)"
-          sorted_expected="$(printf '%s\n' "$expected" | sort)"
-          if [ "$actual" != "$sorted_expected" ]; then
+          expected=$(printf '%s\n' CHANGELOG.md README.md VERSION app.py db.py .github/workflows/docs-0.3.4.yml | sort)
+          actual=$(git diff --cached --name-only | sort)
+          if [ "$actual" != "$expected" ]; then
             echo 'Unexpected staged paths:' >&2
             printf '%s\n' "$actual" >&2
             exit 1
