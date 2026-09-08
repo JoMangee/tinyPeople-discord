@@ -1,6 +1,6 @@
 # tinyPeople Discord Messages API
 
-**Version 0.3.3** — see [CHANGELOG.md](CHANGELOG.md) for history.
+**Version 0.3.7** — see [CHANGELOG.md](CHANGELOG.md) for history.
 
 A Flask API that reads Discord channel messages via a bot token kept server-side.
 
@@ -19,6 +19,8 @@ Try it now: ask your tinyNature for a pairing link and you're good to go.
 - GET /image-chunk
 - GET /health
 - GET /discord/mentions/respond
+- GET /discord/replies/propose
+- GET /discord/replies/approve
 - GET /oauth/authorize
 - GET /oauth/link
 - GET /oauth/status

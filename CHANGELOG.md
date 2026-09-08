@@ -2,6 +2,22 @@
 
 # Changelog
 
+## 0.3.7 — 2026-09-08
+
+### Added
+- Human-gated affirm-reply flow: GET /discord/replies/propose creates a pending proposal; GET /discord/replies/approve?proposal_id=ID&confirm=1 sends it once. Nothing auto-posts; proposals expire after one hour.
+- db.py: reply_proposals table (status pending/approved/sent/expired/failed), UNIQUE (channel_id, source_message_id), atomic claim helper.
+- Discord user/message context menu commands ("tinyPeople Connect", "tinyPeople Help") in addition to existing slash commands.
+- Discord ingress telemetry (`/discord/interactions/ingress`) for interaction delivery debugging.
+- Discord interaction timing metrics endpoint (`/discord/interactions/metrics`).
+- Discord interactions endpoint aliases for routing compatibility (`/discord/interactions`, `/discord/interactions/`, `/api/discord/interactions`).
+
+### Changed
+- BOT_VERSION bumped to 0.3.7 (merges the 0.3.4 affirm-reply flow with the locally shipped 0.3.5/0.3.6 Discord interactions work)
+- README and /help updated for the new endpoints
+- /privacy updated: pending proposals hold source context and the proposed reply until approved, expired, or deleted.
+- Hardened Discord slash payload parsing for type 2 interactions; enforced signature validation for PING interactions.
+
 ## 0.3.3 — 2026-07-19
 
 ### Changed
