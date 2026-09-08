@@ -580,3 +580,149 @@ def get_db() -> Database:
     if _db is None:
         _db = Database()
     return _db
+
+
+# REPLY_PROPOSAL_WORKFLOW_DB_V2
+def _reply_proposal_row(row):
+    if not row:
+        return None
+    columns = (
+        "proposal_id", "tenant_id", "channel_id", "source_message_id",
+        "reply_message", "source_context", "status", "created_at",
+        "expires_at", "approved_at", "sent_at", "result", "error",
+    )
+    return dict(zip(columns, row))
+
+def _reply_init_schema(self):
+    _reply_original_init_schema(self)
+    conn = self._get_conn()
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS reply_proposals (
+            proposal_id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            channel_id TEXT NOT NULL,
+            source_message_id TEXT NOT NULL,
+            reply_message TEXT NOT NULL,
+            source_context TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK(status IN ('pending','approved','sent','expired','failed')),
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            approved_at INTEGER,
+            sent_at INTEGER,
+            result TEXT,
+            error TEXT,
+            UNIQUE(channel_id, source_message_id)
+        )
+        """
+    )
+    conn.commit()
+
+def create_reply_proposal(
+    self, proposal_id, tenant_id, channel_id, source_message_id,
+    reply_message, source_context, created_at, expires_at
+):
+    conn = self._get_conn()
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO reply_proposals
+        (proposal_id, tenant_id, channel_id, source_message_id,
+         reply_message, source_context, status, created_at, expires_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+        """,
+        (proposal_id, tenant_id, channel_id, source_message_id,
+         reply_message, source_context, created_at, expires_at),
+    )
+    conn.commit()
+    return (
+        self.get_reply_proposal(proposal_id)
+        or self.get_reply_proposal_by_source(channel_id, source_message_id)
+    )
+
+def get_reply_proposal(self, proposal_id):
+    row = self._get_conn().execute(
+        """
+        SELECT proposal_id, tenant_id, channel_id, source_message_id,
+               reply_message, source_context, status, created_at,
+               expires_at, approved_at, sent_at, result, error
+        FROM reply_proposals WHERE proposal_id = ?
+        """,
+        (proposal_id,),
+    ).fetchone()
+    return _reply_proposal_row(row)
+
+def get_reply_proposal_by_source(self, channel_id, source_message_id):
+    row = self._get_conn().execute(
+        """
+        SELECT proposal_id, tenant_id, channel_id, source_message_id,
+               reply_message, source_context, status, created_at,
+               expires_at, approved_at, sent_at, result, error
+        FROM reply_proposals
+        WHERE channel_id = ? AND source_message_id = ?
+        """,
+        (channel_id, source_message_id),
+    ).fetchone()
+    return _reply_proposal_row(row)
+
+def expire_reply_proposal_if_needed(self, proposal_id, now):
+    conn = self._get_conn()
+    cur = conn.execute(
+        """
+        UPDATE reply_proposals
+        SET status = 'expired', error = COALESCE(error, 'expired')
+        WHERE proposal_id = ? AND status = 'pending' AND expires_at <= ?
+        """,
+        (proposal_id, now),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+def claim_reply_proposal(self, proposal_id, now):
+    conn = self._get_conn()
+    cur = conn.execute(
+        """
+        UPDATE reply_proposals
+        SET status = 'approved', approved_at = ?, error = NULL
+        WHERE proposal_id = ? AND status = 'pending' AND expires_at > ?
+        """,
+        (now, proposal_id, now),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+def mark_reply_proposal_sent(self, proposal_id, result="sent"):
+    conn = self._get_conn()
+    cur = conn.execute(
+        """
+        UPDATE reply_proposals
+        SET status = 'sent', sent_at = ?, result = ?, error = NULL
+        WHERE proposal_id = ? AND status = 'approved'
+        """,
+        (int(time.time()), result, proposal_id),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+def restore_reply_proposal_pending(self, proposal_id, error=""):
+    conn = self._get_conn()
+    cur = conn.execute(
+        """
+        UPDATE reply_proposals
+        SET status = 'pending', approved_at = NULL, error = ?
+        WHERE proposal_id = ? AND status = 'approved'
+        """,
+        (error, proposal_id),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+_reply_original_init_schema = Database._init_schema
+Database._init_schema = _reply_init_schema
+Database.create_reply_proposal = create_reply_proposal
+Database.get_reply_proposal = get_reply_proposal
+Database.get_reply_proposal_by_source = get_reply_proposal_by_source
+Database.expire_reply_proposal_if_needed = expire_reply_proposal_if_needed
+Database.claim_reply_proposal = claim_reply_proposal
+Database.mark_reply_proposal_sent = mark_reply_proposal_sent
+Database.restore_reply_proposal_pending = restore_reply_proposal_pending
