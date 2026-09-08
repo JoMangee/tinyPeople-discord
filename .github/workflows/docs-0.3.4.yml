@@ -50,19 +50,19 @@ jobs:
           old_release_anchor = "## 0.3.3 — 2026-07-19"
           if changelog.count(old_release_anchor) != 1:
               raise RuntimeError("CHANGELOG.md: missing unique 0.3.3 release anchor")
-          new_release = """
-## 0.3.4 — 2026-09-08
-
-### Added
-          - Human-gated affirm-reply flow: GET /discord/replies/propose creates a pending proposal; GET /discord/replies/approve?proposal_id=ID&confirm=1 sends it once. Nothing auto-posts; proposals expire after one hour.
-          - db.py: reply_proposals table (status pending/approved/sent/expired/failed), UNIQUE (channel_id, source_message_id), atomic claim helper.
-
-### Changed
-          - BOT_VERSION bumped to 0.3.4
-          - README and /help updated for the new endpoints
-          - /privacy updated: pending proposals hold source context and the proposed reply until approved, expired, or deleted.
-
-"""
+          new_release = (
+              "## 0.3.4 — 2026-09-08\n"
+              "\n"
+              "### Added\n"
+              "          - Human-gated affirm-reply flow: GET /discord/replies/propose creates a pending proposal; GET /discord/replies/approve?proposal_id=ID&confirm=1 sends it once. Nothing auto-posts; proposals expire after one hour.\n"
+              "          - db.py: reply_proposals table (status pending/approved/sent/expired/failed), UNIQUE (channel_id, source_message_id), atomic claim helper.\n"
+              "\n"
+              "### Changed\n"
+              "          - BOT_VERSION bumped to 0.3.4\n"
+              "          - README and /help updated for the new endpoints\n"
+              "          - /privacy updated: pending proposals hold source context and the proposed reply until approved, expired, or deleted.\n"
+              "\n"
+          )
           changelog = changelog.replace(old_release_anchor, new_release + old_release_anchor, 1)
           write("CHANGELOG.md", changelog)
 
