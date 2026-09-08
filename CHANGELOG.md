@@ -2,6 +2,12 @@
 
 # Changelog
 
+## 0.3.9 — 2026-09-08
+
+### Security
+- `/discord/replies/approve?...&confirm=1` was a plain `GET` link, so anything that fetches a shared URL without a human clicking it (Discord's own link-unfurl preview bot, browser prefetch, antivirus/link scanners) could trigger a real send just by loading the page. Sending now requires an explicit `POST` form submission; `GET` requests always render the review page only, regardless of `confirm`.
+- The review page's "Confirm and send" is now a form button (POST) instead of a link; "Review only" remains a plain GET link that is always safe to share/preview.
+
 ## 0.3.8 — 2026-09-08
 
 ### Fixed
