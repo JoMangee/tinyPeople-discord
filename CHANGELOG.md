@@ -2,6 +2,18 @@
 
 # Changelog
 
+## 0.3.8 — 2026-09-08
+
+### Fixed
+- `/messages?discord_url=...` no longer rejects guild URLs with `guild_not_associated_with_key` when the channel already has a tenant channel grant; the channel grant is now the single source of truth and the tenant↔guild binding is only checked as a fallback.
+- `/discord/replies/approve` no longer requires `tp_key` in the URL. Approval is now gated by a single-use `token` minted at propose time (hashed at rest, validated in constant time), matching the human-gated design intent.
+- Fixed the root cause of `discord_reply_failed` 502s on approve/send: the raw JSON `source_context` was being passed as the mention user ID, producing an invalid `<@{...}>` mention that Discord rejected. The send path now uses the real author snowflake (or omits the mention) and no longer sends an empty/invalid `allowed_mentions.users` entry.
+- Discord send failures now map to distinct error codes/status (403 `discord_permission_denied`, 404 `discord_message_or_channel_not_found`, 429 `discord_rate_limited`) instead of a blanket 502.
+- Proposal expiry (1 hour) is now shown on the propose/approve review pages.
+
+### Security
+- Any `tp_key` values previously exposed in `/discord/replies/approve` URLs should be rotated; the approve flow no longer accepts or requires an API key.
+
 ## 0.3.7 — 2026-09-08
 
 ### Added

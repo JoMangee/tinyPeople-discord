@@ -11,6 +11,7 @@ Provides lightweight multi-tenant isolation:
 from __future__ import annotations
 
 import hashlib
+import hmac
 import os
 import secrets
 import sqlite3
@@ -653,8 +654,12 @@ def _reply_proposal_row(row):
         "proposal_id", "tenant_id", "channel_id", "source_message_id",
         "reply_message", "source_context", "status", "created_at",
         "expires_at", "approved_at", "sent_at", "result", "error",
+        "approval_token_hash",
     )
     return dict(zip(columns, row))
+
+def _hash_reply_approval_token(token):
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 def _reply_init_schema(self):
     _reply_original_init_schema(self)
@@ -676,26 +681,34 @@ def _reply_init_schema(self):
             sent_at INTEGER,
             result TEXT,
             error TEXT,
+            approval_token_hash TEXT,
             UNIQUE(channel_id, source_message_id)
         )
         """
     )
+    try:
+        conn.execute("ALTER TABLE reply_proposals ADD COLUMN approval_token_hash TEXT")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
     conn.commit()
 
 def create_reply_proposal(
     self, proposal_id, tenant_id, channel_id, source_message_id,
-    reply_message, source_context, created_at, expires_at
+    reply_message, source_context, created_at, expires_at, approval_token=""
 ):
     conn = self._get_conn()
+    approval_token_hash = _hash_reply_approval_token(approval_token) if approval_token else None
     conn.execute(
         """
         INSERT OR IGNORE INTO reply_proposals
         (proposal_id, tenant_id, channel_id, source_message_id,
-         reply_message, source_context, status, created_at, expires_at)
-        VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+         reply_message, source_context, status, created_at, expires_at,
+         approval_token_hash)
+        VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
         """,
         (proposal_id, tenant_id, channel_id, source_message_id,
-         reply_message, source_context, created_at, expires_at),
+         reply_message, source_context, created_at, expires_at,
+         approval_token_hash),
     )
     conn.commit()
     return (
@@ -703,12 +716,25 @@ def create_reply_proposal(
         or self.get_reply_proposal_by_source(channel_id, source_message_id)
     )
 
+def verify_reply_approval_token(self, proposal_id, token):
+    """Constant-time check that token matches the proposal's stored hash."""
+    if not token:
+        return False
+    row = self._get_conn().execute(
+        "SELECT approval_token_hash FROM reply_proposals WHERE proposal_id = ?",
+        (proposal_id,),
+    ).fetchone()
+    if not row or not row[0]:
+        return False
+    return hmac.compare_digest(row[0], _hash_reply_approval_token(token))
+
 def get_reply_proposal(self, proposal_id):
     row = self._get_conn().execute(
         """
         SELECT proposal_id, tenant_id, channel_id, source_message_id,
                reply_message, source_context, status, created_at,
-               expires_at, approved_at, sent_at, result, error
+               expires_at, approved_at, sent_at, result, error,
+               approval_token_hash
         FROM reply_proposals WHERE proposal_id = ?
         """,
         (proposal_id,),
@@ -720,7 +746,8 @@ def get_reply_proposal_by_source(self, channel_id, source_message_id):
         """
         SELECT proposal_id, tenant_id, channel_id, source_message_id,
                reply_message, source_context, status, created_at,
-               expires_at, approved_at, sent_at, result, error
+               expires_at, approved_at, sent_at, result, error,
+               approval_token_hash
         FROM reply_proposals
         WHERE channel_id = ? AND source_message_id = ?
         """,
@@ -783,6 +810,7 @@ def restore_reply_proposal_pending(self, proposal_id, error=""):
 _reply_original_init_schema = Database._init_schema
 Database._init_schema = _reply_init_schema
 Database.create_reply_proposal = create_reply_proposal
+Database.verify_reply_approval_token = verify_reply_approval_token
 Database.get_reply_proposal = get_reply_proposal
 Database.get_reply_proposal_by_source = get_reply_proposal_by_source
 Database.expire_reply_proposal_if_needed = expire_reply_proposal_if_needed
