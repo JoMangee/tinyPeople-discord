@@ -41,7 +41,7 @@ except ImportError:
     init_db = None
     AuthContext = None
 
-BOT_VERSION = "0.3.7"
+BOT_VERSION = "0.3.8"
 APP_DIR = os.path.dirname(__file__)
 load_dotenv(os.path.join(APP_DIR, ".env"))
 load_dotenv(os.path.join(APP_DIR, ".deploy-stamp.env"))
@@ -1686,14 +1686,19 @@ def _build_activity_reply_text(status: dict[str, Any]) -> str:
 
 
 def _compose_reply_content(user_id: str, status: dict[str, Any], custom_reply_message: str = "") -> str:
-    """Compose reply content, using caller-authored text when provided."""
+    """Compose reply content, using caller-authored text when provided.
+
+    user_id must be a real Discord snowflake to produce a mention; pass "" to omit it.
+    """
     custom_text = custom_reply_message.strip()
     if custom_text:
+        if not user_id:
+            return custom_text
         if f"<@{user_id}>" in custom_text or f"<@!{user_id}>" in custom_text:
             return custom_text
         return f"<@{user_id}> {custom_text}"
 
-    return f"<@{user_id}> {_build_activity_reply_text(status)}"
+    return f"<@{user_id}> {_build_activity_reply_text(status)}" if user_id else _build_activity_reply_text(status)
 
 
 def _post_discord_message_reply(
@@ -1703,7 +1708,10 @@ def _post_discord_message_reply(
     status: dict[str, Any],
     custom_reply_message: str = "",
 ) -> None:
-    """Post a Discord threaded reply describing the caller's recent activity."""
+    """Post a Discord threaded reply describing the caller's recent activity.
+
+    user_id must be a real Discord snowflake (or "" to skip mentioning anyone).
+    """
     if not DISCORD_TOKEN:
         raise ApiError("server_missing_discord_token", 503)
 
@@ -1724,7 +1732,7 @@ def _post_discord_message_reply(
                 },
                 "allowed_mentions": {
                     "parse": [],
-                    "users": [user_id],
+                    "users": [user_id] if user_id else [],
                     "replied_user": True,
                 },
             },
@@ -1749,6 +1757,25 @@ def _post_discord_message_reply(
         except ValueError:
             details = {}
 
+        # Map common Discord statuses instead of flattening everything into a 502.
+        if response.status_code == 403:
+            raise ApiError(
+                "discord_permission_denied",
+                403,
+                debug={"discord_status": response.status_code, **details},
+            )
+        if response.status_code == 404:
+            raise ApiError(
+                "discord_message_or_channel_not_found",
+                404,
+                debug={"discord_status": response.status_code, **details},
+            )
+        if response.status_code == 429:
+            raise ApiError(
+                "discord_rate_limited",
+                429,
+                debug={"discord_status": response.status_code, **details},
+            )
         raise ApiError(
             "discord_reply_failed",
             502,
@@ -2765,16 +2792,22 @@ def get_messages() -> tuple[Any, int]:
                         },
                     )
             elif auth_context and auth_context.tenant_id:
+                # Channel grants are the single source of truth for tenant access;
+                # only fall back to guild binding when no channel grant exists.
                 url_guild_id = str(parsed.get("guild_id") or "")
                 db = get_db()
-                tenant = db.get_tenant_by_guild(url_guild_id)
-                if not tenant or tenant["tenant_id"] != auth_context.tenant_id:
-                    oauth_url = _build_oauth_install_url()
-                    raise ApiError(
-                        "guild_not_associated_with_key",
-                        403,
-                        debug={"guild_id": url_guild_id, "install_url": oauth_url},
-                    )
+                channel_granted = url_channel_id in TP_PUBLIC_CHANNEL_IDS or (
+                    db.is_channel_allowed_for_tenant(auth_context.tenant_id, url_channel_id)
+                )
+                if not channel_granted:
+                    tenant = db.get_tenant_by_guild(url_guild_id)
+                    if not tenant or tenant["tenant_id"] != auth_context.tenant_id:
+                        oauth_url = _build_oauth_install_url()
+                        raise ApiError(
+                            "guild_not_associated_with_key",
+                            403,
+                            debug={"guild_id": url_guild_id, "install_url": oauth_url},
+                        )
             # Inject extracted params
             channel_id_raw = url_channel_id
             message_id_raw = url_message_id
@@ -3660,7 +3693,24 @@ def _reply_error_response(exc):
     body = f"<p><strong>Error:</strong> {html.escape(str(exc), quote=True)}</p>"
     return _reply_response(Response(body, mimetype="text/html"), getattr(exc, "status_code", 500))
 
-def _reply_render(proposal, notice=""):
+def _reply_format_exception(exc):
+    """Human-readable error text; ApiError's default str() is just its raw args tuple."""
+    if isinstance(exc, ApiError):
+        detail = exc.debug.get("discord_message") if exc.debug else None
+        suffix = f" ({detail})" if detail else ""
+        return f"{exc.message}{suffix}"
+    return str(exc)
+
+def _reply_context_author_id(proposal):
+    """Extract the source message author's snowflake for mention purposes, if valid."""
+    try:
+        context = json.loads(proposal.get("source_context") or "{}")
+    except (TypeError, ValueError):
+        return ""
+    author_id = str(context.get("author_id") or "").strip()
+    return author_id if author_id.isdigit() else ""
+
+def _reply_render(proposal, notice="", token=None):
     if not proposal:
         return _reply_response(Response("<p>Reply proposal not found.</p>", mimetype="text/html"), 404)
     try:
@@ -3674,13 +3724,23 @@ def _reply_render(proposal, notice=""):
     author = esc(context.get("author_name") or context.get("username") or "unknown")
     content = esc(context.get("content"))
     reply = esc(proposal.get("reply_message"))
+    expires_at = proposal.get("expires_at")
+    expires_text = (
+        esc(datetime.fromtimestamp(int(expires_at), tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
+        if expires_at
+        else ""
+    )
     href_id = quote(str(proposal.get("proposal_id") or ""), safe="")
+    if token is None:
+        token = request.args.get("token", "").strip()
+    token_qs = f"&token={quote(token, safe='')}" if token else ""
     base = request.url_root.rstrip("/")
     approve_url = html.escape(
-        f"{base}/discord/replies/approve?proposal_id={href_id}", quote=True
+        f"{base}/discord/replies/approve?proposal_id={href_id}{token_qs}", quote=True
     )
     confirm_url = html.escape(approve_url + "&confirm=1", quote=True)
     notice_html = f"<p><strong>{esc(notice)}</strong></p>" if notice else ""
+    expires_html = f"<p><strong>Expires:</strong> {expires_text} (proposals are single-use and expire after 1 hour)</p>" if expires_text else ""
     body = f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>Reply proposal</title></head>
 <body>
@@ -3688,6 +3748,7 @@ def _reply_render(proposal, notice=""):
 {notice_html}
 <p><strong>Status:</strong> {status}</p>
 <p><strong>Proposal:</strong> {proposal_id}</p>
+{expires_html}
 <p><strong>Source message:</strong> {source_id}</p>
 <p><strong>Author:</strong> {author}</p>
 <p><strong>Source:</strong></p><pre>{content}</pre>
@@ -3733,6 +3794,7 @@ def discord_replies_propose():
                 Response("<p>Already replied to this message.</p>", mimetype="text/html"), 409
             )
         now = int(time.time())
+        approval_token = secrets.token_urlsafe(32)
         proposal = db.create_reply_proposal(
             proposal_id=secrets.token_urlsafe(32),
             tenant_id=auth_context.tenant_id,
@@ -3742,14 +3804,20 @@ def discord_replies_propose():
             source_context=_reply_source_context(source),
             created_at=now,
             expires_at=now + 3600,
+            approval_token=approval_token,
         )
-        return _reply_render(proposal, "No message was sent. A human must confirm explicitly.")
+        return _reply_render(
+            proposal,
+            "No message was sent. A human must confirm explicitly. Expires in 1 hour.",
+            token=approval_token,
+        )
     except ApiError as exc:
         return _reply_error_response(exc)
 
 @app.route("/discord/replies/approve", methods=["GET"])
 def discord_replies_approve():
     proposal_id = request.args.get("proposal_id", "").strip()
+    token = request.args.get("token", "").strip()
     if not proposal_id:
         return _reply_response(Response("<p>Missing proposal_id.</p>", mimetype="text/html"), 400)
     try:
@@ -3757,17 +3825,20 @@ def discord_replies_approve():
         proposal = db.get_reply_proposal(proposal_id)
         if not proposal:
             return _reply_response(Response("<p>Reply proposal not found.</p>", mimetype="text/html"), 404)
-        _auth_context, db = _reply_authenticate_channel(proposal["channel_id"])
+        # Approval is human-gated by a single-use token minted at propose time,
+        # not an API key, so the confirm link is safe to hand to a person.
+        if not db.verify_reply_approval_token(proposal_id, token):
+            return _reply_response(Response("<p>Invalid or missing approval token.</p>", mimetype="text/html"), 401)
         now = int(time.time())
         db.expire_reply_proposal_if_needed(proposal_id, now)
         proposal = db.get_reply_proposal(proposal_id)
         confirm = request.args.get("confirm", "").strip().lower() in {"1", "true", "yes", "on"}
         if not confirm:
-            return _reply_render(proposal, "Review only. Nothing will be sent without confirm=1.")
+            return _reply_render(proposal, "Review only. Nothing will be sent without confirm=1.", token=token)
         if proposal.get("status") != "pending":
-            return _reply_render(proposal, "This proposal is not pending and was not sent.")
+            return _reply_render(proposal, "This proposal is not pending and was not sent.", token=token)
         if not db.claim_reply_proposal(proposal_id, now):
-            return _reply_render(db.get_reply_proposal(proposal_id), "Another request claimed this proposal, or it expired.")
+            return _reply_render(db.get_reply_proposal(proposal_id), "Another request claimed this proposal, or it expired.", token=token)
         proposal = db.get_reply_proposal(proposal_id)
         channel_id = proposal["channel_id"]
         source_message_id = proposal["source_message_id"]
@@ -3780,20 +3851,20 @@ def discord_replies_approve():
             channel_history=history,
         ):
             db.mark_reply_proposal_sent(proposal_id, "already_replied")
-            return _reply_render(db.get_reply_proposal(proposal_id), "Already replied; no duplicate was sent.")
+            return _reply_render(db.get_reply_proposal(proposal_id), "Already replied; no duplicate was sent.", token=token)
         try:
             _post_discord_message_reply(
                 channel_id,
                 source_message_id,
-                str(proposal.get("source_context") or ""),
+                _reply_context_author_id(proposal),
                 {},
                 custom_reply_message=proposal["reply_message"],
             )
         except Exception as exc:
             db.restore_reply_proposal_pending(proposal_id, str(exc))
-            return _reply_render(db.get_reply_proposal(proposal_id), f"Send failed; proposal restored: {exc}")
+            return _reply_render(db.get_reply_proposal(proposal_id), f"Send failed; proposal restored: {_reply_format_exception(exc)}", token=token)
         db.mark_reply_proposal_sent(proposal_id, "sent")
-        return _reply_render(db.get_reply_proposal(proposal_id), "Reply sent exactly once.")
+        return _reply_render(db.get_reply_proposal(proposal_id), "Reply sent exactly once.", token=token)
     except ApiError as exc:
         return _reply_error_response(exc)
 
