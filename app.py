@@ -3723,7 +3723,7 @@ def _reply_render(proposal, notice="", token=None):
     proposal_id = esc(proposal.get("proposal_id"))
     status = esc(proposal.get("status"))
     source_id = esc(proposal.get("source_message_id"))
-    author = esc(context.get("author_name") or context.get("username") or "unknown")
+    author = esc(context.get("author_name") or context.get("username") or context.get("author") or "unknown") or "unknown")
     content = esc(context.get("content"))
     reply = esc(proposal.get("reply_message"))
     expires_at = proposal.get("expires_at")
