@@ -12,3 +12,5 @@ venv/
 ops/.env
 ops/known_hosts
 ops/LOCALPUSH.md
+CDatawebopsscripts..known_hosts
+.vscode/settings.json
