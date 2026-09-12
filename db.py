@@ -681,8 +681,7 @@ def _reply_init_schema(self):
             sent_at INTEGER,
             result TEXT,
             error TEXT,
-            approval_token_hash TEXT,
-            UNIQUE(channel_id, source_message_id)
+            approval_token_hash TEXT
         )
         """
     )
@@ -690,6 +689,60 @@ def _reply_init_schema(self):
         conn.execute("ALTER TABLE reply_proposals ADD COLUMN approval_token_hash TEXT")
     except sqlite3.OperationalError:
         pass  # Column already exists
+
+    # Migrate off the old global UNIQUE(channel_id, source_message_id) constraint,
+    # which permanently blocked any tenant from proposing a second reply to a
+    # message once any prior proposal existed for it (even cancelled/sent/expired ones).
+    existing_sql_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='reply_proposals'"
+    ).fetchone()
+    existing_sql = (existing_sql_row[0] or "") if existing_sql_row else ""
+    if "UNIQUE(channel_id, source_message_id)" in existing_sql or "UNIQUE (channel_id, source_message_id)" in existing_sql:
+        conn.execute("ALTER TABLE reply_proposals RENAME TO reply_proposals_legacy")
+        conn.execute(
+            """
+            CREATE TABLE reply_proposals (
+                proposal_id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                source_message_id TEXT NOT NULL,
+                reply_message TEXT NOT NULL,
+                source_context TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(status IN ('pending','approved','sent','expired','failed')),
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                approved_at INTEGER,
+                sent_at INTEGER,
+                result TEXT,
+                error TEXT,
+                approval_token_hash TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO reply_proposals
+            (proposal_id, tenant_id, channel_id, source_message_id, reply_message,
+             source_context, status, created_at, expires_at, approved_at, sent_at,
+             result, error, approval_token_hash)
+            SELECT proposal_id, tenant_id, channel_id, source_message_id, reply_message,
+                   source_context, status, created_at, expires_at, approved_at, sent_at,
+                   result, error, approval_token_hash
+            FROM reply_proposals_legacy
+            """
+        )
+        conn.execute("DROP TABLE reply_proposals_legacy")
+
+    # Only one *pending* proposal per tenant+channel+message at a time; resolved
+    # (sent/expired/cancelled) proposals never block a fresh one.
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_reply_proposals_pending_unique
+        ON reply_proposals(tenant_id, channel_id, source_message_id)
+        WHERE status = 'pending'
+        """
+    )
     conn.commit()
 
 def create_reply_proposal(
@@ -713,7 +766,7 @@ def create_reply_proposal(
     conn.commit()
     return (
         self.get_reply_proposal(proposal_id)
-        or self.get_reply_proposal_by_source(channel_id, source_message_id)
+        or self.get_reply_proposal_by_source(channel_id, source_message_id, tenant_id=tenant_id)
     )
 
 def verify_reply_approval_token(self, proposal_id, token):
@@ -741,18 +794,37 @@ def get_reply_proposal(self, proposal_id):
     ).fetchone()
     return _reply_proposal_row(row)
 
-def get_reply_proposal_by_source(self, channel_id, source_message_id):
-    row = self._get_conn().execute(
-        """
-        SELECT proposal_id, tenant_id, channel_id, source_message_id,
-               reply_message, source_context, status, created_at,
-               expires_at, approved_at, sent_at, result, error,
-               approval_token_hash
-        FROM reply_proposals
-        WHERE channel_id = ? AND source_message_id = ?
-        """,
-        (channel_id, source_message_id),
-    ).fetchone()
+def get_reply_proposal_by_source(self, channel_id, source_message_id, tenant_id=None):
+    # Prefer the pending row (if any) since that's the one blocking a new
+    # INSERT via the partial unique index; created_at ties are otherwise
+    # ambiguous (proposals created within the same second).
+    conn = self._get_conn()
+    if tenant_id is not None:
+        row = conn.execute(
+            """
+            SELECT proposal_id, tenant_id, channel_id, source_message_id,
+                   reply_message, source_context, status, created_at,
+                   expires_at, approved_at, sent_at, result, error,
+                   approval_token_hash
+            FROM reply_proposals
+            WHERE channel_id = ? AND source_message_id = ? AND tenant_id = ?
+            ORDER BY (status = 'pending') DESC, created_at DESC, rowid DESC LIMIT 1
+            """,
+            (channel_id, source_message_id, tenant_id),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            """
+            SELECT proposal_id, tenant_id, channel_id, source_message_id,
+                   reply_message, source_context, status, created_at,
+                   expires_at, approved_at, sent_at, result, error,
+                   approval_token_hash
+            FROM reply_proposals
+            WHERE channel_id = ? AND source_message_id = ?
+            ORDER BY (status = 'pending') DESC, created_at DESC, rowid DESC LIMIT 1
+            """,
+            (channel_id, source_message_id),
+        ).fetchone()
     return _reply_proposal_row(row)
 
 def expire_reply_proposal_if_needed(self, proposal_id, now):
@@ -807,6 +879,25 @@ def restore_reply_proposal_pending(self, proposal_id, error=""):
     conn.commit()
     return cur.rowcount > 0
 
+def cancel_reply_proposal(self, proposal_id, now, note=""):
+    """Human-cancel a pending proposal so the agent can see it was rejected.
+
+    Reuses the 'expired' status (no schema enum change) with a distinct error
+    prefix so callers/agents can tell a cancel apart from a real timeout.
+    """
+    conn = self._get_conn()
+    error = f"cancelled_by_human:{note}" if note else "cancelled_by_human"
+    cur = conn.execute(
+        """
+        UPDATE reply_proposals
+        SET status = 'expired', error = ?
+        WHERE proposal_id = ? AND status = 'pending' AND expires_at > ?
+        """,
+        (error, proposal_id, now),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
 _reply_original_init_schema = Database._init_schema
 Database._init_schema = _reply_init_schema
 Database.create_reply_proposal = create_reply_proposal
@@ -817,3 +908,4 @@ Database.expire_reply_proposal_if_needed = expire_reply_proposal_if_needed
 Database.claim_reply_proposal = claim_reply_proposal
 Database.mark_reply_proposal_sent = mark_reply_proposal_sent
 Database.restore_reply_proposal_pending = restore_reply_proposal_pending
+Database.cancel_reply_proposal = cancel_reply_proposal

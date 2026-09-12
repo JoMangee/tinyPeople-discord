@@ -1,6 +1,6 @@
 # tinyPeople Discord Messages API
 
-**Version 0.3.9** — see [CHANGELOG.md](CHANGELOG.md) for history.
+**Version 0.3.10** — see [CHANGELOG.md](CHANGELOG.md) for history.
 
 A Flask API that reads Discord channel messages via a bot token kept server-side.
 
@@ -21,6 +21,7 @@ Try it now: ask your tinyNature for a pairing link and you're good to go.
 - GET /discord/mentions/respond
 - GET /discord/replies/propose
 - GET /discord/replies/approve
+- GET /discord/replies/status
 - GET /oauth/authorize
 - GET /oauth/link
 - GET /oauth/status
@@ -108,6 +109,14 @@ GET /discord/replies/approve?proposal_id=PROPOSAL_ID&token=APPROVAL_TOKEN
 ```
 
 The review link is safe to share and preview: `GET` never sends, even if `confirm=1` is added. A human must open the review page and press **Confirm and send**, which submits an explicit `POST`. Do not put `tp_key` in the approval URL.
+
+Only one *pending* proposal is allowed per tenant+channel+message; a second `propose` call while one is pending returns `409 reply_already_pending` with the existing `proposal_id`. Resolved proposals (sent, expired, or cancelled) never block a new one.
+
+The review page also has a **Cancel** button (POST only) with an optional feedback note, for when the human wants to reject the proposal instead of waiting for it to expire. Agents can poll the outcome (including any cancel note) with:
+
+```text
+GET /discord/replies/status?proposal_id=PROPOSAL_ID&tp_key=YOUR_KEY
+```
 
 ## Key Lifecycle API (Tenant Scoped)
 

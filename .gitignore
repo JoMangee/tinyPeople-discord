@@ -14,3 +14,4 @@ ops/known_hosts
 ops/LOCALPUSH.md
 CDatawebopsscripts..known_hosts
 .vscode/settings.json
+var/tinypeople.db

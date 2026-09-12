@@ -41,7 +41,7 @@ except ImportError:
     init_db = None
     AuthContext = None
 
-BOT_VERSION = "0.3.9"
+BOT_VERSION = "0.3.10"
 APP_DIR = os.path.dirname(__file__)
 load_dotenv(os.path.join(APP_DIR, ".env"))
 load_dotenv(os.path.join(APP_DIR, ".deploy-stamp.env"))
@@ -1854,10 +1854,16 @@ def _build_help_text(base_url: str) -> str:
             "",
             "Affirm-reply (human-gated; nothing sends until you approve):",
             f"{base_url}/discord/replies/propose?channel_id=CHANNEL_ID&message_id=MESSAGE_ID&reply_message=TEXT&tp_key=YOUR_KEY",
+            "Only one pending proposal is allowed per tenant+channel+message; propose again with 409",
+            "reply_already_pending means cancel or resolve the existing one first (see below).",
             "The propose response returns a one-hour, single-use approval token.",
             f"{base_url}/discord/replies/approve?proposal_id=PROPOSAL_ID&token=APPROVAL_TOKEN",
             "Share the review link above if needed; GET never sends, even with confirm=1.",
             "To send, open the review page and press its Confirm and send button (explicit POST only).",
+            "The review page also has a Cancel button (POST only) to reject a pending proposal",
+            "and send optional feedback back to the agent instead of waiting for the 1h expiry.",
+            "Agents can poll proposal outcome (including a human's cancel feedback note) with:",
+            f"{base_url}/discord/replies/status?proposal_id=PROPOSAL_ID&tp_key=YOUR_KEY",
             "Health endpoint:",
             f"{base_url}/health",
         ]
@@ -3692,13 +3698,14 @@ def _reply_response(response, status=None):
     return response
 
 def _reply_error_response(exc):
-    body = f"<p><strong>Error:</strong> {html.escape(str(exc), quote=True)}</p>"
+    body = f"<p><strong>Error:</strong> {html.escape(_reply_format_exception(exc), quote=True)}</p>"
     return _reply_response(Response(body, mimetype="text/html"), getattr(exc, "status_code", 500))
 
 def _reply_format_exception(exc):
     """Human-readable error text; ApiError's default str() is just its raw args tuple."""
     if isinstance(exc, ApiError):
-        detail = exc.debug.get("discord_message") if exc.debug else None
+        debug = exc.debug or {}
+        detail = debug.get("discord_message") or debug.get("existing_proposal_id")
         suffix = f" ({detail})" if detail else ""
         return f"{exc.message}{suffix}"
     return str(exc)
@@ -3751,6 +3758,15 @@ def _reply_render(proposal, notice="", token=None):
 <input type="hidden" name="confirm" value="1">
 <button type="submit">Confirm and send</button>
 </form>"""
+    cancel_form = ""
+    if proposal.get("status") == "pending":
+        cancel_form = f"""<form method="post" action="{approve_url}">
+<input type="hidden" name="proposal_id" value="{proposal_id}">
+<input type="hidden" name="token" value="{esc(token)}">
+<input type="hidden" name="cancel" value="1">
+<label>Feedback for the agent (optional): <input type="text" name="note" maxlength="200"></label>
+<button type="submit">Cancel (send back to agent)</button>
+</form>"""
     body = f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>Reply proposal</title></head>
 <body>
@@ -3765,6 +3781,7 @@ def _reply_render(proposal, notice="", token=None):
 <p><strong>Reply:</strong></p><pre>{reply}</pre>
 <p><a href="{approve_url}">Review only</a> (safe to preview/share; never sends)</p>
 {confirm_form}
+{cancel_form}
 </body></html>"""
     return _reply_response(Response(body, mimetype="text/html"))
 
@@ -3805,8 +3822,9 @@ def discord_replies_propose():
             )
         now = int(time.time())
         approval_token = secrets.token_urlsafe(32)
+        new_proposal_id = secrets.token_urlsafe(32)
         proposal = db.create_reply_proposal(
-            proposal_id=secrets.token_urlsafe(32),
+            proposal_id=new_proposal_id,
             tenant_id=auth_context.tenant_id,
             channel_id=channel_id,
             source_message_id=source_message_id,
@@ -3816,6 +3834,15 @@ def discord_replies_propose():
             expires_at=now + 3600,
             approval_token=approval_token,
         )
+        if proposal.get("proposal_id") != new_proposal_id:
+            # A pending proposal for this tenant+channel+message already exists.
+            # Its approval token was never persisted here, so we can't hand out a
+            # working link for it; the existing one must be cancelled or resolved first.
+            raise ApiError(
+                "reply_already_pending",
+                409,
+                debug={"existing_proposal_id": proposal.get("proposal_id")},
+            )
         return _reply_render(
             proposal,
             "No message was sent. A human must confirm explicitly. Expires in 1 hour.",
@@ -3823,6 +3850,37 @@ def discord_replies_propose():
         )
     except ApiError as exc:
         return _reply_error_response(exc)
+
+@app.route("/discord/replies/status", methods=["GET"])
+def discord_replies_status():
+    """Agent-facing JSON status check, e.g. to see a human cancel + feedback note."""
+    try:
+        proposal_id = request.args.get("proposal_id", "").strip()
+        if not proposal_id:
+            raise ApiError("missing_proposal_id", 400)
+        db = get_db()
+        proposal = db.get_reply_proposal(proposal_id)
+        if not proposal:
+            raise ApiError("reply_proposal_not_found", 404)
+        auth_context = _require_tenant_api_key_context()
+        if proposal.get("tenant_id") != auth_context.tenant_id:
+            raise ApiError("reply_proposal_not_found", 404)
+        db.expire_reply_proposal_if_needed(proposal_id, int(time.time()))
+        proposal = db.get_reply_proposal(proposal_id)
+        error = proposal.get("error") or ""
+        cancelled = error.startswith("cancelled_by_human")
+        note = error.split(":", 1)[1] if cancelled and ":" in error else ""
+        return jsonify(
+            {
+                "proposal_id": proposal.get("proposal_id"),
+                "status": proposal.get("status"),
+                "cancelled_by_human": cancelled,
+                "note": note,
+                "error": None if cancelled else (error or None),
+            }
+        ), 200
+    except ApiError as exc:
+        return jsonify({"error": exc.message}), exc.status_code
 
 @app.route("/discord/replies/approve", methods=["GET", "POST"])
 def discord_replies_approve():
@@ -3842,6 +3900,14 @@ def discord_replies_approve():
         now = int(time.time())
         db.expire_reply_proposal_if_needed(proposal_id, now)
         proposal = db.get_reply_proposal(proposal_id)
+        # Cancel is also POST-only; it just stops the proposal so the agent
+        # can see it was rejected (and optionally why) instead of sending.
+        cancel = request.method == "POST" and request.form.get("cancel", "").strip().lower() in {"1", "true", "yes", "on"}
+        if cancel:
+            note = request.form.get("note", "").strip()[:200]
+            if not db.cancel_reply_proposal(proposal_id, now, note=note):
+                return _reply_render(db.get_reply_proposal(proposal_id), "Could not cancel; it was already claimed, sent, or expired.", token=token)
+            return _reply_render(db.get_reply_proposal(proposal_id), "Cancelled. Nothing was sent; the agent can see this proposal was rejected.", token=token)
         # Sending only ever happens on an explicit POST (form submit). A GET
         # can never send, even with confirm=1, so link previews/crawlers/prefetchers
         # that fetch a shared URL (e.g. Discord unfurling a pasted link) can't trigger it.
