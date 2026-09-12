@@ -39,7 +39,7 @@ class Database:
     def __init__(self, db_path: str | None = None):
         """Initialize database."""
         if db_path is None:
-            db_path = os.path.join(
+            db_path = os.environ.get("TP_DB_PATH") or os.path.join(
                 os.path.dirname(__file__), "var", "tinypeople.db"
             )
         self.db_path = db_path
