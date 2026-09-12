@@ -3,6 +3,7 @@
 ## 0.3.10 — 2026-09-12
 
 ### Fixed
+- Reply proposals now preserve the Discord source author's display name and ID; normalized message output no longer drops the author identity before proposal context is stored.
 - `reply_proposals` had a global `UNIQUE(channel_id, source_message_id)` constraint with no `tenant_id` and no cleanup, so *any* past proposal for a message (pending, sent, cancelled, or expired) permanently blocked every tenant from proposing a new reply to it. Replaced with a partial unique index scoped to `(tenant_id, channel_id, source_message_id)` that only applies while `status = 'pending'`; existing databases are migrated automatically on startup.
 - `propose` now returns `409 reply_already_pending` (with the existing `proposal_id`) instead of silently handing back a stale proposal whose approval token was never issued to the caller.
 

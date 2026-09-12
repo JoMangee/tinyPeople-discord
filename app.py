@@ -1013,6 +1013,8 @@ def _normalize_message(
     message: dict[str, Any], *, include_raw_images: bool = False, embed_mode: str = "raw"
 ) -> dict[str, Any]:
     """Convert Discord message payload to contract output shape."""
+    raw_author = message.get("author")
+    author = raw_author if isinstance(raw_author, dict) else {}
     content = message.get("content", "")
     raw_attachments = message.get("attachments")
     attachments = raw_attachments if isinstance(raw_attachments, list) else []
@@ -1055,7 +1057,14 @@ def _normalize_message(
     normalized = {
         "timestamp": message.get("timestamp"),
         "message_id": message.get("id"),
-        "author": _format_author(message.get("author", {})),
+        "author": _format_author(author),
+        "author_name": str(
+            author.get("global_name")
+            or author.get("display_name")
+            or author.get("username")
+            or "unknown"
+        ),
+        "author_id": str(author.get("id") or ""),
         "content": content,
         "attachment_urls": attachment_urls,
         "image_urls": image_urls,
@@ -3786,10 +3795,22 @@ def _reply_render(proposal, notice="", token=None):
     return _reply_response(Response(body, mimetype="text/html"))
 
 def _reply_source_context(source):
-    author = source.get("author") if isinstance(source.get("author"), dict) else {}
+    raw_author = source.get("author")
+    author = raw_author if isinstance(raw_author, dict) else {}
+    author_name = (
+        str(
+            source.get("author_name")
+            or
+            author.get("global_name")
+            or author.get("display_name")
+            or author.get("username")
+            or raw_author
+            or "unknown"
+        )
+    )
     return json.dumps(
         {
-            "author_name": str(author.get("global_name") or author.get("display_name") or author.get("username") or "unknown"),
+            "author_name": author_name,
             "username": str(author.get("username") or ""),
             "author_id": str(author.get("id") or source.get("author_id") or ""),
             "content": str(source.get("content") or "")[:500],
