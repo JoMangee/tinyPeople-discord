@@ -1740,7 +1740,7 @@ def _post_discord_message_reply(
                     "channel_id": channel_id,
                 },
                 "allowed_mentions": {
-                    "parse": [],
+                    "parse": ["users"],
                     "users": [user_id] if user_id else [],
                     "replied_user": True,
                 },
