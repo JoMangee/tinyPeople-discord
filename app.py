@@ -10,8 +10,12 @@ from __future__ import annotations
 import base64
 from collections import deque
 from datetime import datetime, timezone
+from datetime import datetime, timezone
 import hmac
 import hashlib
+import html
+from urllib.parse import quote
+import json
 import html
 from urllib.parse import quote
 import json
@@ -25,7 +29,13 @@ from typing import Any
 
 import requests
 from dotenv import load_dotenv
-from flask import Flask, Response, g, jsonify, request
+from flask import Flask, Response, g, Response, g, jsonify, request
+try:
+    from nacl.exceptions import BadSignatureError
+    from nacl.signing import VerifyKey
+except ImportError:
+    BadSignatureError = Exception
+    VerifyKey = None
 try:
     from nacl.exceptions import BadSignatureError
     from nacl.signing import VerifyKey
@@ -41,7 +51,7 @@ except ImportError:
     init_db = None
     AuthContext = None
 
-BOT_VERSION = "0.3.10"
+BOT_VERSION = "0.3.110"
 APP_DIR = os.path.dirname(__file__)
 load_dotenv(os.path.join(APP_DIR, ".env"))
 load_dotenv(os.path.join(APP_DIR, ".deploy-stamp.env"))
@@ -85,6 +95,9 @@ SIGNED_TIMESTAMP_TOLERANCE_SECONDS = int(
 )
 METRICS_WINDOW_SECONDS = int(os.getenv("METRICS_WINDOW_SECONDS", "60"))
 UNIQUE_HOST_WINDOW_SECONDS = int(os.getenv("UNIQUE_HOST_WINDOW_SECONDS", "300"))
+INTERACTION_METRICS_WINDOW_SECONDS = int(
+    os.getenv("INTERACTION_METRICS_WINDOW_SECONDS", "3600")
+)
 INTERACTION_METRICS_WINDOW_SECONDS = int(
     os.getenv("INTERACTION_METRICS_WINDOW_SECONDS", "3600")
 )
@@ -1013,6 +1026,8 @@ def _normalize_message(
     message: dict[str, Any], *, include_raw_images: bool = False, embed_mode: str = "raw"
 ) -> dict[str, Any]:
     """Convert Discord message payload to contract output shape."""
+    raw_author = message.get("author")
+    author = raw_author if isinstance(raw_author, dict) else {}
     content = message.get("content", "")
     raw_attachments = message.get("attachments")
     attachments = raw_attachments if isinstance(raw_attachments, list) else []
@@ -1055,7 +1070,14 @@ def _normalize_message(
     normalized = {
         "timestamp": message.get("timestamp"),
         "message_id": message.get("id"),
-        "author": _format_author(message.get("author", {})),
+        "author": _format_author(author),
+        "author_name": str(
+            author.get("global_name")
+            or author.get("display_name")
+            or author.get("username")
+            or "unknown"
+        ),
+        "author_id": str(author.get("id") or ""),
         "content": content,
         "attachment_urls": attachment_urls,
         "image_urls": image_urls,
@@ -3790,6 +3812,293 @@ def _reply_source_context(source):
     return json.dumps(
         {
             "author_name": str(author.get("global_name") or author.get("display_name") or author.get("username") or "unknown"),
+            "username": str(author.get("username") or ""),
+            "author_id": str(author.get("id") or source.get("author_id") or ""),
+            "content": str(source.get("content") or "")[:500],
+            "timestamp": str(source.get("timestamp") or ""),
+        },
+        separators=(",", ":"),
+    )
+
+@app.route("/discord/replies/propose", methods=["GET"])
+def discord_replies_propose():
+    try:
+        channel_id = _validate_channel_id(request.args.get("channel_id"))
+        source_message_id = _validate_message_id(
+            request.args.get("message_id") or request.args.get("source_message_id")
+        )
+        reply_message = request.args.get("reply_message", "")
+        if not reply_message.strip():
+            raise ApiError("missing_reply_message", 400)
+        auth_context, db = _reply_authenticate_channel(channel_id)
+        source = _fetch_discord_message_by_id(channel_id, source_message_id)
+        history = _fetch_discord_messages_raw(channel_id, min(100, max(1, MENTION_REPLY_LOOKBACK_LIMIT)))
+        bot_user_id = _fetch_discord_bot_user_id()
+        if _bot_already_replied_to_message(
+            mention_message_id=source_message_id,
+            bot_user_id=bot_user_id,
+            channel_history=history,
+        ):
+            return _reply_response(
+                Response("<p>Already replied to this message.</p>", mimetype="text/html"), 409
+            )
+        now = int(time.time())
+        approval_token = secrets.token_urlsafe(32)
+        new_proposal_id = secrets.token_urlsafe(32)
+        proposal = db.create_reply_proposal(
+            proposal_id=new_proposal_id,
+            tenant_id=auth_context.tenant_id,
+            channel_id=channel_id,
+            source_message_id=source_message_id,
+            reply_message=reply_message,
+            source_context=_reply_source_context(source),
+            created_at=now,
+            expires_at=now + 3600,
+            approval_token=approval_token,
+        )
+        if proposal.get("proposal_id") != new_proposal_id:
+            # A pending proposal for this tenant+channel+message already exists.
+            # Its approval token was never persisted here, so we can't hand out a
+            # working link for it; the existing one must be cancelled or resolved first.
+            raise ApiError(
+                "reply_already_pending",
+                409,
+                debug={"existing_proposal_id": proposal.get("proposal_id")},
+            )
+        return _reply_render(
+            proposal,
+            "No message was sent. A human must confirm explicitly. Expires in 1 hour.",
+            token=approval_token,
+        )
+    except ApiError as exc:
+        return _reply_error_response(exc)
+
+@app.route("/discord/replies/status", methods=["GET"])
+def discord_replies_status():
+    """Agent-facing JSON status check, e.g. to see a human cancel + feedback note."""
+    try:
+        proposal_id = request.args.get("proposal_id", "").strip()
+        if not proposal_id:
+            raise ApiError("missing_proposal_id", 400)
+        db = get_db()
+        proposal = db.get_reply_proposal(proposal_id)
+        if not proposal:
+            raise ApiError("reply_proposal_not_found", 404)
+        auth_context = _require_tenant_api_key_context()
+        if proposal.get("tenant_id") != auth_context.tenant_id:
+            raise ApiError("reply_proposal_not_found", 404)
+        db.expire_reply_proposal_if_needed(proposal_id, int(time.time()))
+        proposal = db.get_reply_proposal(proposal_id)
+        error = proposal.get("error") or ""
+        cancelled = error.startswith("cancelled_by_human")
+        note = error.split(":", 1)[1] if cancelled and ":" in error else ""
+        return jsonify(
+            {
+                "proposal_id": proposal.get("proposal_id"),
+                "status": proposal.get("status"),
+                "cancelled_by_human": cancelled,
+                "note": note,
+                "error": None if cancelled else (error or None),
+            }
+        ), 200
+    except ApiError as exc:
+        return jsonify({"error": exc.message}), exc.status_code
+
+@app.route("/discord/replies/approve", methods=["GET", "POST"])
+def discord_replies_approve():
+    proposal_id = request.values.get("proposal_id", "").strip()
+    token = request.values.get("token", "").strip()
+    if not proposal_id:
+        return _reply_response(Response("<p>Missing proposal_id.</p>", mimetype="text/html"), 400)
+    try:
+        db = get_db()
+        proposal = db.get_reply_proposal(proposal_id)
+        if not proposal:
+            return _reply_response(Response("<p>Reply proposal not found.</p>", mimetype="text/html"), 404)
+        # Approval is human-gated by a single-use token minted at propose time,
+        # not an API key, so the confirm link is safe to hand to a person.
+        if not db.verify_reply_approval_token(proposal_id, token):
+            return _reply_response(Response("<p>Invalid or missing approval token.</p>", mimetype="text/html"), 401)
+        now = int(time.time())
+        db.expire_reply_proposal_if_needed(proposal_id, now)
+        proposal = db.get_reply_proposal(proposal_id)
+        # Cancel is also POST-only; it just stops the proposal so the agent
+        # can see it was rejected (and optionally why) instead of sending.
+        cancel = request.method == "POST" and request.form.get("cancel", "").strip().lower() in {"1", "true", "yes", "on"}
+        if cancel:
+            note = request.form.get("note", "").strip()[:200]
+            if not db.cancel_reply_proposal(proposal_id, now, note=note):
+                return _reply_render(db.get_reply_proposal(proposal_id), "Could not cancel; it was already claimed, sent, or expired.", token=token)
+            return _reply_render(db.get_reply_proposal(proposal_id), "Cancelled. Nothing was sent; the agent can see this proposal was rejected.", token=token)
+        # Sending only ever happens on an explicit POST (form submit). A GET
+        # can never send, even with confirm=1, so link previews/crawlers/prefetchers
+        # that fetch a shared URL (e.g. Discord unfurling a pasted link) can't trigger it.
+        confirm = request.method == "POST" and request.form.get("confirm", "").strip().lower() in {"1", "true", "yes", "on"}
+        if not confirm:
+            notice = "Review only. Nothing will be sent without an explicit confirm." if request.method == "GET" else "Review only. Nothing will be sent without confirm=1."
+            return _reply_render(proposal, notice, token=token)
+        if proposal.get("status") != "pending":
+            return _reply_render(proposal, "This proposal is not pending and was not sent.", token=token)
+        if not db.claim_reply_proposal(proposal_id, now):
+            return _reply_render(db.get_reply_proposal(proposal_id), "Another request claimed this proposal, or it expired.", token=token)
+        proposal = db.get_reply_proposal(proposal_id)
+        channel_id = proposal["channel_id"]
+        source_message_id = proposal["source_message_id"]
+        history = _fetch_discord_messages_raw(channel_id, min(100, max(1, MENTION_REPLY_LOOKBACK_LIMIT)))
+        bot_user_id = _fetch_discord_bot_user_id()
+        # Re-check Discord after the atomic claim and immediately before send.
+        if _bot_already_replied_to_message(
+            mention_message_id=source_message_id,
+            bot_user_id=bot_user_id,
+            channel_history=history,
+        ):
+            db.mark_reply_proposal_sent(proposal_id, "already_replied")
+            return _reply_render(db.get_reply_proposal(proposal_id), "Already replied; no duplicate was sent.", token=token)
+        try:
+            _post_discord_message_reply(
+                channel_id,
+                source_message_id,
+                _reply_context_author_id(proposal),
+                {},
+                custom_reply_message=proposal["reply_message"],
+            )
+        except Exception as exc:
+            db.restore_reply_proposal_pending(proposal_id, str(exc))
+            return _reply_render(db.get_reply_proposal(proposal_id), f"Send failed; proposal restored: {_reply_format_exception(exc)}", token=token)
+        db.mark_reply_proposal_sent(proposal_id, "sent")
+        return _reply_render(db.get_reply_proposal(proposal_id), "Reply sent exactly once.", token=token)
+    except ApiError as exc:
+        return _reply_error_response(exc)
+
+
+
+
+# REPLY_PROPOSAL_WORKFLOW_APP_V2
+def _reply_authenticate_channel(channel_id):
+    auth_context = _require_tenant_api_key_context()
+    db = get_db()
+    if (
+        channel_id not in TP_PUBLIC_CHANNEL_IDS
+        and not db.is_channel_allowed_for_tenant(auth_context.tenant_id, channel_id)
+    ):
+        raise ApiError("channel_not_allowed_for_tenant", 403)
+    return auth_context, db
+
+def _reply_response(response, status=None):
+    if not hasattr(response, "headers"):
+        response = Response(response, mimetype="text/html")
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["X-Robots-Tag"] = "noindex"
+    if status is not None:
+        response.status_code = status
+    return response
+
+def _reply_error_response(exc):
+    body = f"<p><strong>Error:</strong> {html.escape(_reply_format_exception(exc), quote=True)}</p>"
+    return _reply_response(Response(body, mimetype="text/html"), getattr(exc, "status_code", 500))
+
+def _reply_format_exception(exc):
+    """Human-readable error text; ApiError's default str() is just its raw args tuple."""
+    if isinstance(exc, ApiError):
+        debug = exc.debug or {}
+        detail = debug.get("discord_message") or debug.get("existing_proposal_id")
+        suffix = f" ({detail})" if detail else ""
+        return f"{exc.message}{suffix}"
+    return str(exc)
+
+def _reply_context_author_id(proposal):
+    """Extract the source message author's snowflake for mention purposes, if valid."""
+    try:
+        context = json.loads(proposal.get("source_context") or "{}")
+    except (TypeError, ValueError):
+        return ""
+    author_id = str(context.get("author_id") or "").strip()
+    return author_id if author_id.isdigit() else ""
+
+def _reply_render(proposal, notice="", token=None):
+    if not proposal:
+        return _reply_response(Response("<p>Reply proposal not found.</p>", mimetype="text/html"), 404)
+    try:
+        context = json.loads(proposal.get("source_context") or "{}")
+    except (TypeError, ValueError):
+        context = {}
+    esc = lambda value: html.escape(str(value or ""), quote=True)
+    proposal_id = esc(proposal.get("proposal_id"))
+    status = esc(proposal.get("status"))
+    source_id = esc(proposal.get("source_message_id"))
+    author = esc(context.get("author_name") or context.get("username") or context.get("author") or "unknown")
+    content = esc(context.get("content"))
+    reply = esc(proposal.get("reply_message"))
+    expires_at = proposal.get("expires_at")
+    expires_text = (
+        esc(datetime.fromtimestamp(int(expires_at), tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
+        if expires_at
+        else ""
+    )
+    href_id = quote(str(proposal.get("proposal_id") or ""), safe="")
+    if token is None:
+        token = request.args.get("token", "") or request.form.get("token", "")
+        token = token.strip()
+    token_qs = f"&token={quote(token, safe='')}" if token else ""
+    base = request.url_root.rstrip("/")
+    approve_url = html.escape(
+        f"{base}/discord/replies/approve?proposal_id={href_id}{token_qs}", quote=True
+    )
+    notice_html = f"<p><strong>{esc(notice)}</strong></p>" if notice else ""
+    expires_html = f"<p><strong>Expires:</strong> {expires_text} (proposals are single-use and expire after 1 hour)</p>" if expires_text else ""
+    # Sending requires an explicit POST form submission, not a GET link, so link
+    # previews/prefetchers/crawlers visiting this URL can never trigger a send.
+    confirm_form = f"""<form method="post" action="{approve_url}">
+<input type="hidden" name="proposal_id" value="{proposal_id}">
+<input type="hidden" name="token" value="{esc(token)}">
+<input type="hidden" name="confirm" value="1">
+<button type="submit">Confirm and send</button>
+</form>"""
+    cancel_form = ""
+    if proposal.get("status") == "pending":
+        cancel_form = f"""<form method="post" action="{approve_url}">
+<input type="hidden" name="proposal_id" value="{proposal_id}">
+<input type="hidden" name="token" value="{esc(token)}">
+<input type="hidden" name="cancel" value="1">
+<label>Feedback for the agent (optional): <input type="text" name="note" maxlength="200"></label>
+<button type="submit">Cancel (send back to agent)</button>
+</form>"""
+    body = f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>Reply proposal</title></head>
+<body>
+<h1>Discord reply proposal</h1>
+{notice_html}
+<p><strong>Status:</strong> {status}</p>
+<p><strong>Proposal:</strong> {proposal_id}</p>
+{expires_html}
+<p><strong>Source message:</strong> {source_id}</p>
+<p><strong>Author:</strong> {author}</p>
+<p><strong>Source:</strong></p><pre>{content}</pre>
+<p><strong>Reply:</strong></p><pre>{reply}</pre>
+<p><a href="{approve_url}">Review only</a> (safe to preview/share; never sends)</p>
+{confirm_form}
+{cancel_form}
+</body></html>"""
+    return _reply_response(Response(body, mimetype="text/html"))
+
+def _reply_source_context(source):
+    raw_author = source.get("author")
+    author = raw_author if isinstance(raw_author, dict) else {}
+    author_name = (
+        str(
+            source.get("author_name")
+            or
+            author.get("global_name")
+            or author.get("display_name")
+            or author.get("username")
+            or raw_author
+            or "unknown"
+        )
+    )
+    return json.dumps(
+        {
+            "author_name": author_name,
             "username": str(author.get("username") or ""),
             "author_id": str(author.get("id") or source.get("author_id") or ""),
             "content": str(source.get("content") or "")[:500],
