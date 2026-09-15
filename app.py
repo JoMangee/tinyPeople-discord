@@ -51,7 +51,7 @@ except ImportError:
     init_db = None
     AuthContext = None
 
-BOT_VERSION = "0.3.110"
+BOT_VERSION = "0.3.11"
 APP_DIR = os.path.dirname(__file__)
 load_dotenv(os.path.join(APP_DIR, ".env"))
 load_dotenv(os.path.join(APP_DIR, ".deploy-stamp.env"))
@@ -1753,7 +1753,7 @@ def _post_discord_message_reply(
                     "channel_id": channel_id,
                 },
                 "allowed_mentions": {
-                    "parse": [],
+                    "parse": ["users"],
                     "users": [user_id] if user_id else [],
                     "replied_user": True,
                 },

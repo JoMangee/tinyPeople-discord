@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.11 — 2026-09-15
+
+### Fixed
+- Replies not parsing users so @tinyPeople didn;t tell discord they mentioning people - "parse": [] → "parse": ["users"]
+
 ## 0.3.10 — 2026-09-12
 
 ### Fixed
